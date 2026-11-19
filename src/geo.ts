@@ -16,6 +16,47 @@ export function setView(pivot: P3, fit: number) {
   FIT = fit;
 }
 
+function solve3(M: number[][], b: number[]): [number, number, number] | null {
+  const a = M.map((r, i) => [r[0], r[1], r[2], b[i]]);
+  for (let col = 0; col < 3; col++) {
+    let piv = col;
+    for (let r = col + 1; r < 3; r++) if (Math.abs(a[r][col]) > Math.abs(a[piv][col])) piv = r;
+    if (Math.abs(a[piv][col]) < 1e-9) return null;
+    [a[col], a[piv]] = [a[piv], a[col]];
+    for (let r = 0; r < 3; r++) {
+      if (r === col || a[r][col] === 0) continue;
+      const f = a[r][col] / a[col][col];
+      for (let k = col; k < 4; k++) a[r][k] -= f * a[col][k];
+    }
+  }
+  return [a[0][3] / a[0][0], a[1][3] / a[1][1], a[2][3] / a[2][2]];
+}
+
+/**
+ * Inverse of project(): screen point back onto the horizontal plane y = level.
+ * Used so a finger can drag a piece across the floor instead of orbiting.
+ */
+export function unprojectGround(sx: number, sy: number, cam: Cam, w: number, h: number, level: number): [number, number] {
+  const ca = Math.cos(cam.az);
+  const sa = Math.sin(cam.az);
+  const ce = Math.cos(cam.el);
+  const se = Math.sin(cam.el);
+  const f0 = Math.min(w, h) * 1.2 * FIT;
+  const A = sx - w / 2;
+  const B = h / 2 + h * 0.04 - sy;
+  const yv = level - PIVOT[1];
+  const sol = solve3(
+    [
+      [ca, -sa, -A],
+      [ce * sa, ce * ca, f0],
+      [-se * sa, -se * ca, -B],
+    ],
+    [0, cam.dist - yv * se, -yv * ce]
+  );
+  if (!sol) return [PIVOT[0], PIVOT[2]];
+  return [sol[0] + PIVOT[0], sol[1] + PIVOT[2]];
+}
+
 export function project(p: P3, cam: Cam, w: number, h: number): P2 {
   const x = p[0] - PIVOT[0];
   const y = p[1] - PIVOT[1];
@@ -471,6 +512,7 @@ function drawFrame(ctx: Ctx, unit: Unit, box: Box, cut = false) {
     [x0, z0 + W],
     [x0 + L, z0 + W],
   ]) {
+    if (near(cx, cz)) continue;
     solid(ctx, unit.id + 'post' + cx + cz, unit.id, [cx - c / 2, y0 + 0.14, cz - c / 2, cx + c / 2, y0 + H - 0.14, cz + c / 2], '#3E4246', { kind: 'trim', k: 1.02 });
   }
 }
@@ -498,6 +540,21 @@ const rot2 = (x: number, z: number, k: number): [number, number] => {
       return [x, z];
   }
 };
+
+/** world delta → local (x,z) delta for an item, by finite difference of its world centre */
+export function localDelta(unit: Unit, box: Box, it: Item, dwx: number, dwz: number): [number, number] {
+  const at = (x: number, z: number) => itemWorldBox(unit, box, { ...it, x, z }, 0, 0, 0, 0, 0, 0);
+  const p0 = at(it.x, it.z);
+  const px = at(it.x + 0.01, it.z);
+  const pz = at(it.x, it.z + 0.01);
+  const a11 = (px.wx - p0.wx) / 0.01;
+  const a21 = (px.wz - p0.wz) / 0.01;
+  const a12 = (pz.wx - p0.wx) / 0.01;
+  const a22 = (pz.wz - p0.wz) / 0.01;
+  const det = a11 * a22 - a12 * a21;
+  if (Math.abs(det) < 1e-9) return [0, 0];
+  return [(dwx * a22 - dwz * a12) / det, (a11 * dwz - a21 * dwx) / det];
+}
 
 export function itemWorldBox(unit: Unit, box: Box, it: Item, px: number, py: number, pz: number, pw: number, ph: number, pd: number) {
   const k = (((unit.rot as number) + (it.rot as number)) % 4 + 4) % 4;

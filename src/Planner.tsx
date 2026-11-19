@@ -204,7 +204,7 @@ export function Planner() {
     setCut(m === 'plan');
   };
 
-  const onSelect = (unitId: string | null, itemId: string | null) => {
+      const onSelect = (unitId: string | null, itemId: string | null) => {
     setSelected(unitId);
     setSelectedItem(itemId);
     if (unitId && !itemId) setTab('detail');
@@ -269,7 +269,18 @@ export function Planner() {
         )}
 
         <View style={styles.stage}>
-          <Viewport units={units} selected={selected} selectedItem={selectedItem} onSelect={onSelect} mode={mode} cam={cam} setCam={setCam} cut={cut} />
+          <Viewport
+            units={units}
+            selected={selected}
+            selectedItem={selectedItem}
+            onSelect={onSelect}
+            onMoveItem={(uidUnit, iid, x, z) => patchItem(uidUnit, iid, { x, z })}
+            onMoveUnit={(uid, x, z) => patch(uid, { x, z })}
+            mode={mode}
+            cam={cam}
+            setCam={setCam}
+            cut={cut}
+          />
 
           <View style={styles.overlayTop} pointerEvents="none">
             <View style={styles.chip}>
@@ -301,7 +312,7 @@ export function Planner() {
           </View>
 
           <Text style={styles.hint} pointerEvents="none">
-            drag to orbit · pinch or scroll to zoom · tap to select
+                drag a piece to move it · drag the floor to orbit · pinch to zoom
           </Text>
         </View>
 
