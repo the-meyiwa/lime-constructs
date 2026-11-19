@@ -7,14 +7,15 @@ import { Inspector } from './components/Inspector';
 import { QuoteSheet } from './components/QuoteSheet';
 import { Icon } from './components/Icon';
 import { Btn } from './components/ui';
-import { PRESETS, TYPE, makeOpening, makeUnit } from './data';
+import { PRESETS, TYPE, makeOpening, makeUnit, uid } from './data';
 import { buildQuote } from './quote';
 import { footprint } from './geo';
-import type { Cam, Unit, ViewMode, Wall } from './types';
-import { c, r } from './theme';
+import { FURN, itemRect } from './furniture';
+import type { Cam, Item, Unit, ViewMode, Wall } from './types';
+import { c } from './theme';
 
 const camFor = (mode: ViewMode): Cam =>
-  mode === 'plan' ? { az: 0, el: 1.52, dist: 27 } : { az: 0.8, el: 0.58, dist: 21 };
+  mode === 'plan' ? { az: 0, el: 1.52, dist: 27 } : { az: 0.86, el: 0.42, dist: 21 };
 
 const rectOf = (u: Unit) => {
   const p = footprint(u);
@@ -51,7 +52,49 @@ function warnings(units: Unit[]) {
     if (covered < area * 0.75) out.push('Level ' + (units[i].level + 1) + ' unit has little support beneath it');
   }
 
-  return out;
+  for (const u of units) {
+    const t = TYPE[u.type];
+    for (const it of u.items) {
+      const f = FURN[it.kind];
+      if (!f) continue;
+      const rr = itemRect(it);
+      if (rr.u0 < 0.03 || rr.w0 < 0.03 || rr.u1 > t.len - 0.03 || rr.w1 > t.wid - 0.03) {
+        out.push(f.name + ' runs through a wall');
+      }
+      if (f.h + 0.12 > t.hgt) out.push(f.name + ' is too tall for a ' + t.short);
+    }
+    for (let i = 0; i < u.items.length; i++) {
+      for (let j = i + 1; j < u.items.length; j++) {
+        const a = itemRect(u.items[i]);
+        const b = itemRect(u.items[j]);
+        const ox = Math.min(a.u1, b.u1) - Math.max(a.u0, b.u0);
+        const oz = Math.min(a.w1, b.w1) - Math.max(a.w0, b.w0);
+        if (ox > 0.06 && oz > 0.06) out.push('Two pieces of furniture overlap (level ' + (u.level + 1) + ')');
+      }
+    }
+    for (const o of u.openings) {
+      if (o.kind !== 'door') continue;
+      const reach = 0.95;
+      const z = o.wall === 'left' ? 0 : o.wall === 'right' ? t.wid : o.along;
+      const x = o.wall === 'left' || o.wall === 'right' ? o.along : o.wall === 'front' ? t.len : 0;
+      const zone =
+        o.wall === 'left'
+          ? { u0: x - o.w / 2, u1: x + o.w / 2, w0: 0, w1: reach }
+          : o.wall === 'right'
+          ? { u0: x - o.w / 2, u1: x + o.w / 2, w0: t.wid - reach, w1: t.wid }
+          : o.wall === 'front'
+          ? { u0: t.len - reach, u1: t.len, w0: z - o.w / 2, w1: z + o.w / 2 }
+          : { u0: 0, u1: reach, w0: z - o.w / 2, w1: z + o.w / 2 };
+      for (const it of u.items) {
+        const rr = itemRect(it);
+        const ox = Math.min(rr.u1, zone.u1) - Math.max(rr.u0, zone.u0);
+        const oz = Math.min(rr.w1, zone.w1) - Math.max(rr.w0, zone.w0);
+        if (ox > 0.02 && oz > 0.02) out.push(FURN[it.kind]?.name + ' blocks a door swing');
+      }
+    }
+  }
+
+  return Array.from(new Set(out));
 }
 
 export function Planner() {
@@ -61,38 +104,48 @@ export function Planner() {
 
   const [units, setUnits] = useState<Unit[]>(PRESETS[1].units);
   const [selected, setSelected] = useState<string | null>(null);
+  const [selectedItem, setSelectedItem] = useState<string | null>(null);
   const [mode, setMode] = useState<ViewMode>('3d');
+  const [cut, setCut] = useState(false);
   const [cam, setCam] = useState<Cam>(camFor('3d'));
   const narrow = width < 430;
   const [quote, setQuote] = useState(false);
   const [tab, setTab] = useState<'build' | 'detail'>('build');
   const [toast, setToast] = useState<string | null>(null);
   const [history, setHistory] = useState<Unit[][]>([]);
-  const [future, setFuture] = useState<Unit[][]>([]);
 
   const commit = useCallback(
     (next: Unit[]) => {
       setHistory((h) => [...h.slice(-30), units]);
-      setFuture([]);
       setUnits(next);
     },
     [units]
   );
 
   const patch = (id: string, p: Partial<Unit>) => commit(units.map((u) => (u.id === id ? { ...u, ...p } : u)));
+  const patchItem = (uidUnit: string, iid: string, p: Partial<Item>) =>
+    commit(units.map((u) => (u.id === uidUnit ? { ...u, items: u.items.map((i) => (i.id === iid ? { ...i, ...p } : i)) } : u)));
 
   const addUnit = (typeId: string) => {
     const t = TYPE[typeId];
     const right = units.length ? Math.max(...units.map((u) => u.x + (u.rot ? t.wid : t.len))) : 0;
-    const u = makeUnit(typeId, units.length ? right + 0.8 : 0, 0, { color: 'charcoal' });
+    const u = makeUnit(typeId, units.length ? right + 0.8 : 0, 0, { color: t.group === 'cabin' ? 'cream' : 'charcoal' });
     commit([...units, u]);
     setSelected(u.id);
+    setSelectedItem(null);
   };
 
   const duplicate = () => {
     const u = units.find((x) => x.id === selected);
     if (!u) return;
-    const copy = { ...u, id: makeUnit(u.type, 0, 0).id, x: u.x, z: u.z + 3.2 };
+    const copy = {
+      ...u,
+      id: uid('unit'),
+      x: u.x,
+      z: u.z + 3.2,
+      openings: u.openings.map((o) => ({ ...o, id: uid('op') })),
+      items: u.items.map((i) => ({ ...i, id: uid('it') })),
+    };
     commit([...units, copy]);
     setSelected(copy.id);
   };
@@ -100,6 +153,7 @@ export function Planner() {
   const removeSelected = () => {
     commit(units.filter((u) => u.id !== selected));
     setSelected(null);
+    setSelectedItem(null);
   };
 
   const addOpening = (typeId: string, wall: Wall) => {
@@ -107,22 +161,53 @@ export function Planner() {
     if (!u) return;
     const t = TYPE[u.type];
     const along = (wall === 'front' || wall === 'back' ? t.wid : t.len) / 2;
-    const o = makeOpening(typeId, wall, along);
-    patch(u.id, { openings: [...u.openings, o] });
+    patch(u.id, { openings: [...u.openings, makeOpening(typeId, wall, along)] });
+  };
+
+  const addItem = (kind: string) => {
+    const u = units.find((x) => x.id === selected);
+    if (!u) return;
+    const t = TYPE[u.type];
+    const n = u.items.length;
+    const it: Item = {
+      id: uid('it'),
+      kind,
+      x: Math.min(t.len - 1, 1 + (n % 3) * 0.9),
+      z: Math.min(t.wid - 0.6, (FURN[kind].d || 0.6) / 2 + 0.1 + (n % 2) * 0.8),
+      rot: 0,
+    };
+    patch(u.id, { items: [...u.items, it] });
+    setSelectedItem(it.id);
+    toastFor(FURN[kind].name + ' added');
+  };
+
+  const removeItem = (iid: string) => {
+    const u = units.find((x) => x.id === selected);
+    if (!u) return;
+    patch(u.id, { items: u.items.filter((i) => i.id !== iid) });
+    if (selectedItem === iid) setSelectedItem(null);
   };
 
   const selectedUnit = units.find((u) => u.id === selected) || null;
   const warn = useMemo(() => warnings(units), [units]);
+
   const money = useMemo(() => buildQuote(units), [units]);
 
   const toastFor = (msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast(null), 1800);
+    setTimeout(() => setToast(null), 1700);
   };
 
   const setView = (m: ViewMode) => {
     setMode(m);
     setCam(camFor(m));
+    setCut(m === 'plan');
+  };
+
+  const onSelect = (unitId: string | null, itemId: string | null) => {
+    setSelected(unitId);
+    setSelectedItem(itemId);
+    if (unitId && !itemId) setTab('detail');
   };
 
   return (
@@ -158,6 +243,7 @@ export function Planner() {
             ))}
           </View>
 
+          <Btn compact icon="layers" active={cut} onPress={() => setCut(!cut)} />
           <Btn compact icon="reset" onPress={() => setCam(camFor(mode))} />
           <Btn compact icon="quote" active={quote} onPress={() => setQuote(true)} />
         </View>
@@ -166,17 +252,29 @@ export function Planner() {
       <View style={[styles.body, wide && { flexDirection: 'row' }]}>
         {wide && (
           <View style={styles.leftRail}>
-            <BuildPanel onAdd={addUnit} onPreset={(u) => { commit(u.map((x) => ({ ...x }))); setSelected(null); }} onClear={() => { commit([]); setSelected(null); }} />
+            <BuildPanel
+              onAdd={addUnit}
+              onPreset={(u) => {
+                commit(u.map((x) => ({ ...x })));
+                setSelected(null);
+                setSelectedItem(null);
+              }}
+              onClear={() => {
+                commit([]);
+                setSelected(null);
+                setSelectedItem(null);
+              }}
+            />
           </View>
         )}
 
         <View style={styles.stage}>
-          <Viewport units={units} selected={selected} onSelect={setSelected} mode={mode} cam={cam} setCam={setCam} />
+          <Viewport units={units} selected={selected} selectedItem={selectedItem} onSelect={onSelect} mode={mode} cam={cam} setCam={setCam} cut={cut} />
 
           <View style={styles.overlayTop} pointerEvents="none">
             <View style={styles.chip}>
               <Icon name={mode === '3d' ? 'cube' : 'plan'} size={12} color={c.dim} />
-              <Text style={styles.chipText}>{mode === '3d' ? 'orbit view' : 'plan view'}</Text>
+              <Text style={styles.chipText}>{cut ? 'interior view' : 'orbit view'}</Text>
             </View>
             {warn.length > 0 && (
               <View style={[styles.chip, { borderColor: 'rgba(228,160,160,0.35)' }]}>
@@ -185,6 +283,13 @@ export function Planner() {
               </View>
             )}
           </View>
+
+          {!cut && selectedUnit && (
+            <Pressable onPress={() => setCut(true)} style={styles.enterChip}>
+              <Icon name="layers" size={12} color={c.lime} />
+              <Text style={styles.enterChipText}>see the fit-out inside</Text>
+            </Pressable>
+          )}
 
           <View style={styles.zoom} pointerEvents="box-none">
             <Pressable onPress={() => setCam({ ...cam, dist: Math.max(9, cam.dist - 3) })} style={styles.zoomBtn}>
@@ -196,7 +301,7 @@ export function Planner() {
           </View>
 
           <Text style={styles.hint} pointerEvents="none">
-            drag to orbit · pinch or scroll to zoom · tap a unit to select
+            drag to orbit · pinch or scroll to zoom · tap to select
           </Text>
         </View>
 
@@ -204,13 +309,16 @@ export function Planner() {
           <View style={styles.rightRail}>
             <Inspector
               unit={selectedUnit}
+              itemId={selectedItem}
               onChange={(p) => selected && patch(selected, p)}
               onDelete={removeSelected}
               onDuplicate={duplicate}
               onAddOpening={addOpening}
-              onRemoveOpening={(oid) =>
-                selectedUnit && patch(selectedUnit.id, { openings: selectedUnit.openings.filter((o) => o.id !== oid) })
-              }
+              onRemoveOpening={(oid) => selectedUnit && patch(selectedUnit.id, { openings: selectedUnit.openings.filter((o) => o.id !== oid) })}
+              onAddItem={addItem}
+              onPatchItem={(iid, p) => selectedUnit && patchItem(selectedUnit.id, iid, p)}
+              onRemoveItem={removeItem}
+              onSelectItem={setSelectedItem}
             />
           </View>
         )}
@@ -228,17 +336,32 @@ export function Planner() {
             </View>
             <View style={{ flex: 1 }}>
               {tab === 'build' ? (
-                <BuildPanel onAdd={addUnit} onPreset={(u) => { commit(u.map((x) => ({ ...x }))); setSelected(null); }} onClear={() => { commit([]); setSelected(null); }} />
+                <BuildPanel
+                  onAdd={addUnit}
+                  onPreset={(u) => {
+                    commit(u.map((x) => ({ ...x })));
+                    setSelected(null);
+                    setSelectedItem(null);
+                  }}
+                  onClear={() => {
+                    commit([]);
+                    setSelected(null);
+                    setSelectedItem(null);
+                  }}
+                />
               ) : (
                 <Inspector
                   unit={selectedUnit}
+                  itemId={selectedItem}
                   onChange={(p) => selected && patch(selected, p)}
                   onDelete={removeSelected}
                   onDuplicate={duplicate}
                   onAddOpening={addOpening}
-                  onRemoveOpening={(oid) =>
-                    selectedUnit && patch(selectedUnit.id, { openings: selectedUnit.openings.filter((o) => o.id !== oid) })
-                  }
+                  onRemoveOpening={(oid) => selectedUnit && patch(selectedUnit.id, { openings: selectedUnit.openings.filter((o) => o.id !== oid) })}
+                  onAddItem={addItem}
+                  onPatchItem={(iid, p) => selectedUnit && patchItem(selectedUnit.id, iid, p)}
+                  onRemoveItem={removeItem}
+                  onSelectItem={setSelectedItem}
                 />
               )}
             </View>
@@ -298,6 +421,21 @@ const styles = StyleSheet.create({
     paddingVertical: 5,
   },
   chipText: { color: c.dim, fontSize: 10.5, letterSpacing: 0.6 },
+  enterChip: {
+    position: 'absolute',
+    bottom: 40,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    borderWidth: 1,
+    borderColor: 'rgba(201,242,77,0.4)',
+    backgroundColor: 'rgba(10,11,13,0.85)',
+    borderRadius: 999,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+  },
+  enterChipText: { color: c.lime, fontSize: 11 },
   zoom: { position: 'absolute', right: 12, top: 12, gap: 6 },
   zoomBtn: {
     width: 32,

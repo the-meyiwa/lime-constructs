@@ -1,26 +1,37 @@
 import React, { useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { OPENING_TYPES, SHELLS, TYPE } from '../data';
+import { CATS, FURN, FURNITURE } from '../furniture';
 import { unitArea } from '../quote';
-import type { Unit } from '../types';
+import type { Item, Unit } from '../types';
 import { c, r } from '../theme';
 import { Icon } from './Icon';
 import { Btn, Label, Row } from './ui';
 
 export function Inspector({
   unit,
+  itemId,
   onChange,
   onDelete,
   onDuplicate,
   onAddOpening,
   onRemoveOpening,
+  onAddItem,
+  onPatchItem,
+  onRemoveItem,
+  onSelectItem,
 }: {
   unit: Unit | null;
+  itemId: string | null;
   onChange: (patch: Partial<Unit>) => void;
   onDelete: () => void;
   onDuplicate: () => void;
   onAddOpening: (typeId: string, wall: Unit['openings'][0]['wall']) => void;
   onRemoveOpening: (id: string) => void;
+  onAddItem: (kind: string) => void;
+  onPatchItem: (id: string, patch: Partial<Item>) => void;
+  onRemoveItem: (id: string) => void;
+  onSelectItem: (id: string | null) => void;
 }) {
   const [wall, setWall] = useState<Unit['openings'][0]['wall']>('left');
 
@@ -29,12 +40,15 @@ export function Inspector({
       <View style={styles.empty}>
         <Icon name="cube" size={26} color={c.mute} />
         <Text style={styles.emptyTitle}>Nothing selected</Text>
-        <Text style={styles.emptyBody}>Tap a unit in the scene to edit its level, shell and openings.</Text>
+        <Text style={styles.emptyBody}>Tap a unit to edit its shell and openings, or a piece of furniture to move it.</Text>
       </View>
     );
   }
 
   const t = TYPE[unit.type];
+  const shell = SHELLS.find((s) => s.id === unit.color) || SHELLS[0];
+  const item = unit.items.find((x) => x.id === itemId) || null;
+  const fit = unit.items.reduce((a, i) => a + (FURN[i.kind]?.price || 0), 0);
 
   return (
     <ScrollView style={styles.wrap} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
@@ -68,18 +82,77 @@ export function Inspector({
         <Text style={styles.axis}>Z {unit.z.toFixed(1)}</Text>
       </Row>
 
-      <Label style={{ marginTop: 22 }}>Shell</Label>
-      <Row style={{ gap: 8, marginTop: 10 }}>
+      <Row style={{ marginTop: 22, justifyContent: 'space-between' }}>
+        <Label>Shell</Label>
+        <Text style={styles.shellName}>{shell.name}</Text>
+      </Row>
+      <View style={styles.swatches}>
         {SHELLS.map((s) => (
           <Pressable
             key={s.id}
             onPress={() => onChange({ color: s.id })}
-            style={[styles.swatch, { backgroundColor: 'rgb(' + Math.round(s.g * 255) + ',' + Math.round(s.g * 255) + ',' + Math.round(s.g * 255) + ')' }, unit.color === s.id && styles.swatchOn]}
+            style={[styles.swatch, { backgroundColor: s.hex }, unit.color === s.id && styles.swatchOn]}
           />
         ))}
+      </View>
+
+      <Row style={{ marginTop: 22, justifyContent: 'space-between' }}>
+        <Label>Fit-out</Label>
+        <Text style={styles.shellName}>{'N' + Math.round(fit / 1000) + 'k'}</Text>
       </Row>
 
-      <Label style={{ marginTop: 22 }}>Openings</Label>
+      {unit.items.map((it) => {
+        const f = FURN[it.kind];
+        if (!f) return null;
+        const on = it.id === itemId;
+        return (
+          <Pressable key={it.id} onPress={() => onSelectItem(on ? null : it.id)} style={[styles.itemRow, on && styles.itemRowOn]}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.itemName, on && { color: c.lime }]}>{f.name}</Text>
+              <Text style={styles.itemMeta}>
+                {f.w.toFixed(2)} x {f.d.toFixed(2)} x {f.h.toFixed(2)} m · {(f.price / 1000).toFixed(0)}k
+              </Text>
+            </View>
+            <Pressable onPress={() => onRemoveItem(it.id)} hitSlop={10}>
+              <Icon name="close" size={13} color={c.mute} />
+            </Pressable>
+          </Pressable>
+        );
+      })}
+
+      {item && (
+        <View style={styles.itemCtl}>
+          <Row style={{ justifyContent: 'space-between' }}>
+            <Text style={styles.itemCtlName}>{FURN[item.kind]?.name}</Text>
+            <Text style={styles.itemMeta}>rotation {item.rot * 90}°</Text>
+          </Row>
+          <Row style={{ gap: 8, marginTop: 8 }}>
+            <Btn compact icon="rotate" style={{ flex: 1 }} onPress={() => onPatchItem(item.id, { rot: (((item.rot + 1) % 4) as 0 | 1 | 2 | 3) })} />
+            <Btn compact icon="minus" style={{ flex: 1 }} onPress={() => onPatchItem(item.id, { x: Math.max(0.2, item.x - 0.1) })} />
+            <Btn compact icon="plus" style={{ flex: 1 }} onPress={() => onPatchItem(item.id, { x: item.x + 0.1 })} />
+            <Btn compact icon="trash" danger onPress={() => onRemoveItem(item.id)} />
+          </Row>
+        </View>
+      )}
+
+      {CATS.map((cat) => {
+        const list = FURNITURE.filter((f) => f.cat === cat.id);
+        return (
+          <View key={cat.id}>
+            <Text style={styles.cat}>{cat.label}</Text>
+            <View style={styles.grid}>
+              {list.map((f) => (
+                <Pressable key={f.id} onPress={() => onAddItem(f.id)} style={({ pressed }) => [styles.add, pressed && { borderColor: c.lime }]}>
+                  <Text style={styles.addName}>{f.name}</Text>
+                  <Text style={styles.addMeta}>{(f.price / 1000).toFixed(0)}k</Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+        );
+      })}
+
+      <Label style={{ marginTop: 26 }}>Openings</Label>
       {unit.openings.length === 0 && <Text style={styles.hint}>No openings yet. A sealed box is cheap and dark.</Text>}
       {unit.openings.map((o) => (
         <Row key={o.id} style={styles.opening}>
@@ -117,7 +190,7 @@ export function Inspector({
 
 const styles = StyleSheet.create({
   wrap: { flex: 1 },
-  content: { padding: 16, paddingBottom: 30 },
+  content: { padding: 16, paddingBottom: 34 },
   empty: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 30, gap: 8 },
   emptyTitle: { color: c.dim, fontSize: 14, marginTop: 6 },
   emptyBody: { color: c.mute, fontSize: 12, lineHeight: 18, textAlign: 'center' },
@@ -127,8 +200,21 @@ const styles = StyleSheet.create({
   actions: { flexDirection: 'row', gap: 8, marginTop: 16 },
   pad: { gap: 8, marginTop: 8 },
   axis: { color: c.dim, fontSize: 11.5, width: 54, textAlign: 'right' },
-  swatch: { width: 34, height: 34, borderRadius: 8, borderWidth: 1, borderColor: c.line2 },
+  shellName: { color: c.dim, fontSize: 11.5 },
+  swatches: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
+  swatch: { width: 30, height: 30, borderRadius: 7, borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
   swatchOn: { borderColor: c.lime, borderWidth: 2 },
+  cat: { color: c.mute, fontSize: 9.5, letterSpacing: 1.4, textTransform: 'uppercase', marginTop: 14 },
+  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 7, marginTop: 7 },
+  add: { width: '47%', borderWidth: 1, borderColor: c.line, borderRadius: r.sm, paddingVertical: 8, paddingHorizontal: 9, backgroundColor: c.panel },
+  addName: { color: c.text, fontSize: 11.5 },
+  addMeta: { color: c.mute, fontSize: 10, marginTop: 2 },
+  itemRow: { flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: c.line, backgroundColor: c.panel, borderRadius: r.sm, padding: 9, marginTop: 7 },
+  itemRowOn: { borderColor: c.lime },
+  itemName: { color: c.text, fontSize: 12 },
+  itemMeta: { color: c.mute, fontSize: 10.5, marginTop: 2 },
+  itemCtl: { borderWidth: 1, borderColor: c.line2, backgroundColor: c.panel2, borderRadius: r.sm, padding: 10, marginTop: 8 },
+  itemCtlName: { color: c.text, fontSize: 12, fontWeight: '600' },
   hint: { color: c.mute, fontSize: 11.5, marginTop: 10 },
   opening: { backgroundColor: c.panel, borderWidth: 1, borderColor: c.line, borderRadius: r.sm, padding: 10, marginTop: 8 },
   openingName: { color: c.text, fontSize: 12.5 },

@@ -1,5 +1,7 @@
 import type { Opening, Unit } from './types';
+import { FURN } from './furniture';
 
+/** storey height: a stacked container clears the one below */
 export const FLOOR = 2.75;
 
 export type UnitType = {
@@ -26,15 +28,30 @@ export const UNIT_TYPES: UnitType[] = [
 
 export const TYPE = Object.fromEntries(UNIT_TYPES.map((t) => [t.id, t])) as Record<string, UnitType>;
 
-export const SHELLS: { id: string; name: string; g: number }[] = [
-  { id: 'black', name: 'Black', g: 0.22 },
-  { id: 'charcoal', name: 'Charcoal', g: 0.36 },
-  { id: 'slate', name: 'Slate', g: 0.5 },
-  { id: 'sand', name: 'Sand', g: 0.7 },
-  { id: 'white', name: 'White', g: 0.95 },
+export type Shell = {
+  id: string;
+  name: string;
+  hex: string;
+  /** cabin default: sandwich panel, not corten */
+  cabin?: boolean;
+};
+
+export const SHELLS: Shell[] = [
+  { id: 'charcoal', name: 'Charcoal', hex: '#3B3E44' },
+  { id: 'black', name: 'Black', hex: '#26282B' },
+  { id: 'slate', name: 'Slate', hex: '#5C6772' },
+  { id: 'corten', name: 'Corten', hex: '#8F5A39' },
+  { id: 'oxide', name: 'Oxide red', hex: '#7E3A2D' },
+  { id: 'olive', name: 'Olive', hex: '#57614A' },
+  { id: 'sage', name: 'Sage', hex: '#8B9C8A' },
+  { id: 'ocean', name: 'Ocean', hex: '#2F5468' },
+  { id: 'mustard', name: 'Mustard', hex: '#B08434' },
+  { id: 'sand', name: 'Sand', hex: '#B3A084' },
+  { id: 'cream', name: 'Cream', hex: '#D8D1C1', cabin: true },
+  { id: 'white', name: 'White', hex: '#E7E8E4', cabin: true },
 ];
 
-export const shellG = (id: string) => (SHELLS.find((s) => s.id === id) || SHELLS[1]).g;
+export const shellOf = (id: string): Shell => SHELLS.find((s) => s.id === id) || SHELLS[0];
 
 export type OpeningType = {
   id: string;
@@ -69,7 +86,7 @@ let seq = 100;
 export const uid = (p = 'u') => p + '_' + seq++;
 
 export function makeUnit(type: string, x: number, z: number, extra: Partial<Unit> = {}): Unit {
-  return { id: uid('unit'), type, x, z, level: 0, rot: 0, color: 'charcoal', openings: [], ...extra };
+  return { id: uid('unit'), type, x, z, level: 0, rot: 0, color: 'charcoal', openings: [], items: [], ...extra };
 }
 
 export function makeOpening(typeId: string, wall: Opening['wall'], along: number): Opening {
@@ -87,20 +104,31 @@ export function makeOpening(typeId: string, wall: Opening['wall'], along: number
   };
 }
 
+const item = (kind: string, x: number, z: number, rot: 0 | 1 | 2 | 3): any => ({ id: uid('it'), kind, x, z, rot });
+
+/** place against a side wall: z works out from the piece's own depth */
+export const fit = (kind: string, u: number, side: 'left' | 'right', wid: number, rot: 0 | 1 | 2 | 3 = 0) => {
+  const f = FURN[kind];
+  const d = rot % 2 ? f.w : f.d;
+  const z = side === 'left' ? d / 2 + 0.06 : wid - d / 2 - 0.06;
+  return item(kind, u, z, rot) as any;
+};
+
 export const PRESETS: { id: string; name: string; meta: string; note: string; units: Unit[] }[] = [
   {
     id: 'studio',
     name: '20 ft studio',
     meta: '1 unit · 14 m2',
-    note: 'Slider in the long wall, deck off the door end.',
+    note: 'Slider in the long wall, bed and kitchen along the blind side.',
     units: [
       makeUnit('20ft', 0, 0, {
-        color: 'sand',
+        color: 'sage',
         openings: [
-          makeOpening('slider', 'left', 3.2),
-          makeOpening('window', 'right', 2.0),
-          makeOpening('glass-door', 'front', 1.2),
+          makeOpening('slider', 'left', 1.6),
+          makeOpening('window', 'right', 5.0),
+          makeOpening('glass-door', 'front', 2.4),
         ],
+        items: [fit('kitchen', 1.6, 'right', 2.44), fit('bed-double', 4.0, 'right', 2.44), fit('fridge', 5.2, 'left', 2.44)],
       }),
     ],
   },
@@ -108,15 +136,24 @@ export const PRESETS: { id: string; name: string; meta: string; note: string; un
     id: 'loft',
     name: '40 HC loft',
     meta: '1 unit · 28 m2',
-    note: 'Picture window plus clerestory for cross light.',
+    note: 'Picture window plus clerestory, living at one end, sleep at the other.',
     units: [
       makeUnit('40hc', 0, 0, {
-        color: 'slate',
+        color: 'oxide',
         openings: [
-          makeOpening('bifold', 'left', 6.0),
+          makeOpening('bifold', 'left', 5.0),
           makeOpening('wide-window', 'right', 3.0),
-          makeOpening('clerestory', 'left', 10.2),
+          makeOpening('clerestory', 'left', 10.4),
           makeOpening('glass-door', 'front', 1.2),
+        ],
+        items: [
+          fit('sofa', 2.0, 'right', 2.44),
+          fit('media', 1.6, 'left', 2.44),
+          fit('dining', 7.6, 'left', 2.44),
+          fit('kitchen', 8.0, 'right', 2.44),
+          fit('fridge', 9.4, 'right', 2.44),
+          fit('wardrobe', 9.0, 'left', 2.44),
+          fit('bed-double', 10.4, 'left', 2.44),
         ],
       }),
     ],
@@ -130,11 +167,13 @@ export const PRESETS: { id: string; name: string; meta: string; note: string; un
       makeUnit('40ft', 0, 0, {
         color: 'slate',
         openings: [makeOpening('slider', 'left', 5.0), makeOpening('window', 'right', 4.0)],
+        items: [fit('sofa', 3.0, 'right', 2.44), fit('dining', 7.0, 'right', 2.44)],
       }),
       makeUnit('40ft', 0, 0, {
         level: 1,
         color: 'white',
-        openings: [makeOpening('slider', 'left', 8.0), makeOpening('wide-window', 'right', 3.0)],
+        openings: [makeOpening('slider', 'left', 5.5), makeOpening('wide-window', 'right', 4.0)],
+        items: [fit('bed-double', 3.0, 'right', 2.44), fit('wardrobe', 5.0, 'right', 2.44), fit('desk', 8.0, 'left', 2.44)],
       }),
     ],
   },
@@ -147,12 +186,14 @@ export const PRESETS: { id: string; name: string; meta: string; note: string; un
       makeUnit('40ft', 0, 0, {
         color: 'charcoal',
         openings: [makeOpening('slider', 'left', 4.0), makeOpening('window', 'right', 6.0)],
+        items: [fit('sofa', 2.6, 'right', 2.44), fit('kitchen', 7.0, 'left', 2.44), fit('dining', 9.8, 'right', 2.44)],
       }),
-      makeUnit('20ft', 7.4, 1.8, {
+      makeUnit('20ft', 7.4, 2.6, {
         rot: 1,
         level: 0,
         color: 'charcoal',
         openings: [makeOpening('wide-window', 'left', 3.0), makeOpening('window', 'front', 1.1)],
+        items: [fit('bed-double', 4.6, 'right', 2.44), fit('shower', 1.3, 'left', 2.44), fit('basin', 3.0, 'right', 2.44)],
       }),
     ],
   },

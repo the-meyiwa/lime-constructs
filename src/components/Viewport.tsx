@@ -1,7 +1,7 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { PanResponder, StyleSheet, View } from 'react-native';
 import Svg, { Polygon, Polyline, Line, Text as SvgText } from 'react-native-svg';
-import { buildScene, detailLines, edges, inPoly, project, setView, unitBox, type Face } from '../geo';
+import { buildScene, edges, inPoly, itemEdges, project, setView, unitBox, type Face } from '../geo';
 import { TYPE } from '../data';
 import type { Cam, Unit, ViewMode } from '../types';
 import { c } from '../theme';
@@ -9,17 +9,21 @@ import { c } from '../theme';
 export function Viewport({
   units,
   selected,
+  selectedItem,
   onSelect,
   mode,
   cam,
   setCam,
+  cut,
 }: {
   units: Unit[];
   selected: string | null;
-  onSelect: (id: string | null) => void;
+  selectedItem: string | null;
+  onSelect: (unitId: string | null, itemId: string | null) => void;
   mode: ViewMode;
   cam: Cam;
   setCam: (c: Cam) => void;
+  cut: boolean;
 }) {
   const [size, setSize] = useState({ w: 0, h: 0 });
   const camRef = useRef(cam);
@@ -28,7 +32,7 @@ export function Viewport({
   const start = useRef({ az: 0, el: 0, dist: 0, x: 0, y: 0, pinch: 0, moved: false });
 
   const scene = useMemo(() => {
-    if (!size.w || !size.h) return { faces: [] as Face[], grid: [] as number[][][], detail: [] as { pts: number[][]; stroke: string }[], ground: [] as number[][] };
+    if (!size.w || !size.h) return { faces: [] as Face[], grid: [] as number[][][], shadows: [] as { pts: number[][]; a: number }[], ground: [] as number[][] };
 
     const boxes = units.map(unitBox);
     const bx0 = boxes.length ? Math.min(...boxes.map((b) => b.x0)) : 0;
@@ -45,16 +49,16 @@ export function Viewport({
     const projected = corners.map((p) => project(p, cam, size.w, size.h));
     const pw = Math.max(...projected.map((p) => p.x)) - Math.min(...projected.map((p) => p.x));
     const ph = Math.max(...projected.map((p) => p.y)) - Math.min(...projected.map((p) => p.y));
-    const fit = pw > 1 && ph > 1 ? Math.min((size.w * 0.8) / pw, (size.h * 0.78) / ph) : 1;
+    const fit = pw > 1 && ph > 1 ? Math.min((size.w * 0.82) / pw, (size.h * 0.8) / ph) : 1;
     setView(pivot, Math.max(0.15, Math.min(4, fit)));
 
-    const faces = buildScene(units, cam, size.w, size.h, selected).sort((a, b) => b.depth - a.depth);
-    facesRef.current = faces.filter((f) => !f.hidden);
+    const built = buildScene(units, cam, size.w, size.h, { unit: selected, item: selectedItem }, cut);
+    facesRef.current = built.faces.slice().sort((a, b) => b.depth - a.depth);
 
-    const minX = bx0 - 2.5;
-    const maxX = bx1 + 2.5;
-    const minZ = bz0 - 2.5;
-    const maxZ = bz1 + 2.5;
+    const minX = bx0 - 3;
+    const maxX = bx1 + 3;
+    const minZ = bz0 - 3;
+    const maxZ = bz1 + 3;
 
     const grid: number[][][] = [];
     const step = 1.2;
@@ -75,14 +79,19 @@ export function Viewport({
       project([maxX, 0, maxZ], cam, size.w, size.h),
       project([minX, 0, maxZ], cam, size.w, size.h),
     ];
-    const detail = detailLines(units, cam, size.w, size.h);
-    return { faces, grid, detail, ground: g.map((p) => [p.x, p.y]) as number[][] }; 
-  }, [units, cam, size, selected]);
+    return {
+      faces: facesRef.current,
+      grid,
+      shadows: built.shadows,
+      ground: g.map((p) => [p.x, p.y]) as number[][],
+    };
+  }, [units, cam, size, selected, selectedItem, cut]);
 
-  const sel = useMemo(
-    () => (selected && size.w ? edges(units, cam, size.w, size.h, selected) : []),
-    [selected, units, cam, size]
-  );
+  const sel = useMemo(() => {
+    if (!size.w || !selected) return [];
+    if (selectedItem) return itemEdges(units, cam, size.w, size.h, selected, selectedItem);
+    return edges(units, cam, size.w, size.h, selected);
+  }, [selected, selectedItem, units, cam, size]);
 
   const labels = useMemo(() => {
     if (!size.w) return [] as { x: number; y: number; text: string; sel: boolean }[];
@@ -130,7 +139,8 @@ export function Viewport({
           const x = e.nativeEvent.locationX;
           const y = e.nativeEvent.locationY;
           const hit = facesRef.current.find((f) => inPoly([x, y], f.pts));
-          onSelect(hit ? hit.unit : null);
+          if (!hit) return onSelect(null, null);
+          onSelect(hit.unit, hit.item ?? null);
         },
       }),
     [mode, onSelect, setCam]
@@ -140,36 +150,27 @@ export function Viewport({
     <View style={styles.wrap} onLayout={(e) => setSize({ w: e.nativeEvent.layout.width, h: e.nativeEvent.layout.height })} {...responder.panHandlers}>
       {size.w > 0 && (
         <Svg width={size.w} height={size.h}>
-          <Polygon points={scene.ground.map((p) => p.join(',')).join(' ')} fill="#0B0C0E" stroke={c.line} strokeWidth={1} />
+          <Polygon points={scene.ground.map((p) => p.join(',')).join(' ')} fill="#15171A" stroke={c.line} strokeWidth={1} />
           {scene.grid.map((l, i) => (
-            <Line key={'g' + i} x1={l[0][0]} y1={l[0][1]} x2={l[1][0]} y2={l[1][1]} stroke="rgba(255,255,255,0.05)" strokeWidth={1} />
+            <Line key={'g' + i} x1={l[0][0]} y1={l[0][1]} x2={l[1][0]} y2={l[1][1]} stroke="rgba(255,255,255,0.045)" strokeWidth={1} />
           ))}
-          {scene.faces.map((f) =>
-            f.hidden ? null : (
-              <Polygon
-                key={f.key}
-                points={f.pts.map((p) => p.join(',')).join(' ')}
-                fill={f.fill}
-                stroke={f.stroke}
-                strokeWidth={0.7}
-              />
-            )
-          )}
-          {scene.detail.map((l, i) => (
-            <Line key={'d' + i} x1={l.pts[0][0]} y1={l.pts[0][1]} x2={l.pts[1][0]} y2={l.pts[1][1]} stroke={l.stroke} strokeWidth={1} />
+          {scene.shadows.map((s, i) => (
+            <Polygon key={'sh' + i} points={s.pts.map((p) => p.join(',')).join(' ')} fill={'rgba(0,0,0,' + s.a + ')'} stroke="none" />
+          ))}
+          {scene.faces.map((f) => (
+            <Polygon
+              key={f.key}
+              points={f.pts.map((p) => p.join(',')).join(' ')}
+              fill={f.fill}
+              stroke={f.stroke}
+              strokeWidth={f.kind === 'item' ? 0.5 : 0.7}
+            />
           ))}
           {sel.map((e, i) => (
             <Polyline key={'e' + i} points={e.map((p) => p.join(',')).join(' ')} fill="none" stroke={c.lime} strokeWidth={1.4} opacity={0.9} />
           ))}
           {labels.map((l, i) => (
-            <SvgText
-              key={'l' + i}
-              x={l.x}
-              y={l.y}
-              fill={l.sel ? c.lime : 'rgba(255,255,255,0.55)'}
-              fontSize={11}
-              textAnchor="middle"
-            >
+            <SvgText key={'l' + i} x={l.x} y={l.y} fill={l.sel ? c.lime : 'rgba(255,255,255,0.5)'} fontSize={11} textAnchor="middle">
               {l.text}
             </SvgText>
           ))}
