@@ -103,10 +103,10 @@ function push(
 ) {
   const proj = pts.map((p) => project(p, ctx.cam, ctx.w, ctx.h));
   const depth = proj.reduce((a, p) => a + p.d, 0) / proj.length;
-  ctx.out.push({
-    key,
-    unit,
-    item: opt.item,
+      ctx.out.push({
+        key: key + '#' + ctx.out.length,
+        unit,
+        item: opt.item,
     pts: proj.map((p) => [p.x, p.y]),
     fill: shade(hex, n, ctx.cam, opt.k ?? 1, opt.ao ?? 1),
     stroke: opt.stroke ?? 'none',
@@ -436,7 +436,7 @@ function drawRoof(ctx: Ctx, unit: Unit, box: Box) {
   void de;
 }
 
-function drawFrame(ctx: Ctx, unit: Unit, box: Box) {
+function drawFrame(ctx: Ctx, unit: Unit, box: Box, cut = false) {
   const t = TYPE[unit.type];
   const { x0, z0, y0, L, W, H } = box;
   if (t.group === 'cabin') {
@@ -446,12 +446,20 @@ function drawFrame(ctx: Ctx, unit: Unit, box: Box) {
   }
   const c = 0.18;
   const cast = 0.17;
+  // in cutaway the near corner posts would stand in front of the room, so they go too
+  const near = (cx: number, cz: number) => {
+    if (!cut) return false;
+    const dx = cx === x0 ? -1 : 1;
+    const dz = cz === z0 ? -1 : 1;
+    return normalVisible([dx, 0, 0], ctx.cam) || normalVisible([0, 0, dz], ctx.cam);
+  };
   for (const [cx, cz] of [
     [x0, z0],
     [x0 + L, z0],
     [x0, z0 + W],
     [x0 + L, z0 + W],
   ]) {
+    if (near(cx, cz)) continue;
     for (const cy of [y0, y0 + H]) {
       solid(ctx, unit.id + 'cast' + cx + cz + cy, unit.id, [cx - cast / 2, cy - (cy === y0 ? 0.02 : 0.15), cz - cast / 2, cx + cast / 2, cy + (cy === y0 ? 0.15 : 0.02), cz + cast / 2], '#43474B', { kind: 'trim', k: 0.9 });
     }
@@ -534,7 +542,7 @@ export function buildScene(
   for (const u of units) {
     const box = unitBox(u);
     drawPad(ctx, u, box);
-    drawFrame(ctx, u, box);
+    drawFrame(ctx, u, box, cut);
 
     if (u.level === 0) {
       const { x0, z0, L, W, y0 } = box;
