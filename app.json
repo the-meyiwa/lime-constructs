@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "lime constructs",
-    "slug": "lime-constructs",
+    "slug": "madselkie",
     "version": "1.0.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
@@ -29,6 +29,18 @@
     "web": {
       "favicon": "./assets/favicon.png",
       "bundler": "metro"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "bde51a83-0a69-4576-978c-09bfcd07366f"
+      }
+    },
+    "owner": "madselkiee",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/bde51a83-0a69-4576-978c-09bfcd07366f"
     }
   }
 }

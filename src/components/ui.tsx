@@ -13,30 +13,66 @@ export function Btn({
   onPress,
   active,
   danger,
+  disabled,
   style,
   compact,
+  holdRepeat,
 }: {
   icon?: string;
   label?: string;
   onPress?: () => void;
   active?: boolean;
   danger?: boolean;
+  disabled?: boolean;
   style?: ViewStyle;
   compact?: boolean;
+  holdRepeat?: boolean;
 }) {
-  const color = active ? c.lime : danger ? '#E4A0A0' : c.text;
+  const color = disabled ? c.mute : active ? c.lime : danger ? '#E4A0A0' : c.text;
+  const onPressRef = React.useRef(onPress);
+  onPressRef.current = onPress;
+  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopHold = React.useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  React.useEffect(() => stopHold, [stopHold]);
+
+  const handlePressIn = () => {
+    if (disabled || !holdRepeat) return;
+    stopHold();
+    timerRef.current = setTimeout(() => {
+      intervalRef.current = setInterval(() => {
+        onPressRef.current?.();
+      }, 95);
+    }, 320);
+  };
+
   return (
     <Pressable
-      onPress={onPress}
+      onPress={disabled ? undefined : onPress}
+      onPressIn={handlePressIn}
+      onPressOut={stopHold}
+      disabled={disabled}
       style={({ pressed }) => [
         styles.btn,
         compact && styles.btnCompact,
         active && styles.btnActive,
-        pressed && { opacity: 0.65 },
+        disabled && { opacity: 0.38 },
+        pressed && !disabled && { opacity: 0.65 },
         style,
       ]}
     >
-      {icon ? <Icon name={icon} size={compact ? 16 : 17} color={color} /> : null}
+      {icon ? <Icon name={icon} size={compact ? 15 : 17} color={color} /> : null}
       {label ? <Text style={[styles.btnText, { color }]}>{label}</Text> : null}
     </Pressable>
   );
@@ -68,6 +104,6 @@ const styles = StyleSheet.create({
   },
   btnCompact: { height: 32, paddingHorizontal: 9, borderRadius: 8 },
   btnActive: { borderColor: c.lime, backgroundColor: 'rgba(201,242,77,0.09)' },
-  btnText: { fontSize: 12.5, fontWeight: '600', letterSpacing: 0.2 },
+  btnText: { fontSize: 12, fontWeight: '600', letterSpacing: 0.2 },
   row: { flexDirection: 'row', alignItems: 'center' },
 });
