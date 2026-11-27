@@ -1,827 +1,2150 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Platform, Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+/* ============================================================
+   Container Builder — Lime Constructs (React Native & Web)
+
+   One app window: a parts library on the left, the 3D site in the
+   middle, an inspector on the right and a status bar with the live
+   price. Build with any number of containers and cabins, side by side
+   or stacked, then specify, price and print the quotation.
+
+   Interaction: click/tap to select, drag a selected part or unit to
+   move it (units snap to each other's edges), right-click or long-press
+   anywhere for actions, Delete / R / Ctrl+D / arrows on the keyboard.
+   ============================================================ */
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+  useWindowDimensions,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Viewport } from './components/Viewport';
-import { BuildPanel } from './components/BuildPanel';
-import { Inspector } from './components/Inspector';
-import { QuoteSheet } from './components/QuoteSheet';
+import { Viewport, placementAt, type HitResult } from './components/Viewport';
+import { BuildPanel, type PlaceTarget } from './components/BuildPanel';
+import { Inspector, fmtArea, fmtLen } from './components/Inspector';
+import { SpecPanel } from './components/SpecPanel';
+import { QuoteSheet, type CompanyMeta } from './components/QuoteSheet';
+import { RatesPanel } from './components/RatesPanel';
+import { PresetsModal } from './components/PresetsModal';
+import { ContextMenu, type ContextMenuConfig, type ContextMenuItem } from './components/ContextMenu';
 import { Icon } from './components/Icon';
-import { Btn } from './components/ui';
-import { CORNER_POST_MARGIN, OPENING, PRESETS, TYPE, makeOpening, makeUnit } from './data';
-import { buildQuote, formatCompact } from './quote';
-import { footprint, unitBox, unsupportedCorners, wallLen } from './geo';
-import { displaceUnits } from './displacement';
-import type { Cam, Opening, ProjectMeta, Unit, ViewMode, Wall, WarningItem } from './types';
+import {
+  PART,
+  PRESETS,
+  UNIT_TYPE,
+  WALLS,
+  extOf,
+  layoutUnits,
+  planSize,
+  unitRect,
+  type PlacedItem,
+  type PresetDef,
+  type UnitModel,
+  type WallId,
+} from './container-library';
+import {
+  COMMERCIAL_DEFAULTS,
+  defaultRateBook,
+  type CustomMaterial,
+  type RateBook,
+} from './container-catalog';
+import {
+  buildQuote,
+  money,
+  type CommercialSettings,
+  type CurrencyCode,
+  type CustomLine,
+  type LineOverride,
+} from './container-quote';
+import { BASE_Y, worldToUnitLocal, type Cam, type SelRef } from './geo';
 import { c } from './theme';
 
-const camFor = (mode: ViewMode): Cam =>
-  mode === 'plan' ? { az: 0, el: 1.52, dist: 27 } : { az: 0.8, el: 0.58, dist: 21 };
+const LS_RATES = 'toolbox.container.rates';
+const LS_COMPANY = 'toolbox.container.company';
+const LS_MATERIALS = 'toolbox.container.materials';
+const LS_PROJECT = 'toolbox.container.project';
 
-const rectOf = (u: Unit) => {
-  const p = footprint(u);
-  return { x0: p[0][0], x1: p[1][0], z0: p[0][1], z1: p[2][1] };
+const DEFAULT_SPEC: Record<string, string> = {
+  shell: 'buy-20',
+  prep: 'full',
+  exterior: 'paint',
+  insulation: 'pu25',
+  framing: 'steel40',
+  interior: 'ply9',
+  ceiling: 'pvc',
+  floor: 'vinyl',
+  subfloor: 'marine18',
+  paint: 'emulsion',
+  glazing: 'standard',
+  roofing: 'coating',
+  foundation: 'pads',
 };
 
-function evaluateWarnings(units: Unit[]): WarningItem[] {
-  const out: WarningItem[] = [];
-  const rects = units.map(rectOf);
+const today = () => new Date().toISOString().slice(0, 10);
+const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+const r3 = (v: number) => Math.round(v * 1000) / 1000;
+const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
 
-  // 1. Overlapping units on the same level
-  for (let i = 0; i < units.length; i++) {
-    for (let j = i + 1; j < units.length; j++) {
-      if (units[i].level !== units[j].level) continue;
-      const a = rects[i];
-      const b = rects[j];
-      const ox = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
-      const oz = Math.min(a.z1, b.z1) - Math.max(a.z0, b.z0);
-      if (ox > 0.04 && oz > 0.04) {
-        const nameA = units[i].label || TYPE[units[i].type]?.short || 'Unit';
-        const nameB = units[j].label || TYPE[units[j].type]?.short || 'Unit';
-        out.push({
-          id: 'overlap_' + units[i].id + '_' + units[j].id,
-          severity: 'error',
-          unitIds: [units[i].id, units[j].id],
-          text: `${nameA} and ${nameB} overlap by ${(ox * oz).toFixed(1)} m² on L${units[i].level + 1}`,
-        });
-      }
+const CAM_VIEWS: Record<'iso' | 'top' | 'front' | 'left', Cam> = {
+  iso: { az: 0.78, el: 0.52, dist: 21 },
+  top: { az: 0, el: 1.52, dist: 27 },
+  front: { az: 1.57, el: 0.08, dist: 21 },
+  left: { az: 3.14, el: 0.08, dist: 21 },
+};
+
+const quickParts = {
+  wall: ['personnel-door', 'window', 'sliding-door', 'picture-window', 'clerestory'],
+  floor: ['partition', 'kitchen', 'sofa', 'double-bed', 'shower'],
+  roof: ['roof-deck', 'solar', 'skylight'],
+  site: ['deck', 'pergola', 'ext-stair'],
+};
+
+const wallSpan = (u: UnitModel, wall: WallId) => (wall === 'front' || wall === 'back' ? u.wid : u.len);
+const unitName = (u: UnitModel) => u.name || `${UNIT_TYPE[u.preset]?.name || 'Unit'}`;
+const levelName = (L: number) => (L === 0 ? 'Ground' : `Level ${L}`);
+
+function freeAlong(u: UnitModel, wall: WallId, w: number): number | null {
+  const span = wallSpan(u, wall);
+  const taken = u.items
+    .filter((i) => (i.kind === 'opening' || i.kind === 'facade') && i.wall === wall)
+    .map((i) => [(i.along ?? 0) - (i.w ?? 0) / 2 - 0.15, (i.along ?? 0) + (i.w ?? 0) / 2 + 0.15]);
+  const edge =
+    (wall === 'left' || wall === 'right') && u.preset !== 'custom' && !UNIT_TYPE[u.preset]?.shell?.startsWith('fab')
+      ? 0.3
+      : 0.12;
+  for (let t = 0; t <= 1; t += 0.05) {
+    for (const a of [span / 2 + (t * span) / 2, span / 2 - (t * span) / 2]) {
+      const lo = a - w / 2;
+      const hi = a + w / 2;
+      if (lo < edge || hi > span - edge) continue;
+      if (!taken.some(([x, y]) => hi > x && lo < y)) return r3(a);
     }
   }
-
-  // 2. Upper-level support & cantilever checks
-  const hasUpperUnits = units.some((u) => u.level > 0);
-  const hasStairs = units.some((u) => u.stairs);
-  if (hasUpperUnits && !hasStairs) {
-    const upperIds = units.filter((u) => u.level > 0).map((u) => u.id);
-    out.push({
-      id: 'no_stairs',
-      severity: 'warn',
-      unitIds: upperIds,
-      text: 'Upper level has no external staircase assigned (enable External Steel Stair in Detail)',
-    });
-  }
-
-  for (let i = 0; i < units.length; i++) {
-    const u = units[i];
-    const name = u.label || TYPE[u.type]?.short || 'Unit';
-    const box = unitBox(u);
-
-    if (u.level > 0) {
-      const a = rects[i];
-      const area = (a.x1 - a.x0) * (a.z1 - a.z0);
-      let covered = 0;
-      for (let j = 0; j < units.length; j++) {
-        if (units[j].level !== u.level - 1) continue;
-        const b = rects[j];
-        const ox = Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0));
-        const oz = Math.max(0, Math.min(a.z1, b.z1) - Math.max(a.z0, b.z0));
-        covered += ox * oz;
-      }
-      const cols = unsupportedCorners(u, units);
-      if (covered < area * 0.45) {
-        out.push({
-          id: 'floating_' + u.id,
-          severity: 'error',
-          unitIds: [u.id],
-          text: `${name} (L${u.level + 1}) has <45% lower support (${cols.length} steel columns auto-added to BoQ)`,
-        });
-      } else if (cols.length > 0) {
-        out.push({
-          id: 'cantilever_' + u.id,
-          severity: 'warn',
-          unitIds: [u.id],
-          text: `${name} (L${u.level + 1}) cantilevers ${cols.length} corner(s) — ${cols.length} SHS steel columns added to BoQ`,
-        });
-      }
-    }
-
-    // 3. Opening collision, corner post clearance, and excessive wall removal checks
-    for (const w of ['front', 'back', 'left', 'right'] as const) {
-      const wLen = wallLen(w, box);
-      const wallOps = u.openings.filter((o) => o.wall === w);
-      let cutWidth = 0;
-
-      for (let a = 0; a < wallOps.length; a++) {
-        const oa = wallOps[a];
-        cutWidth += oa.w;
-        const leftEdge = oa.along - oa.w / 2;
-        const rightEdge = oa.along + oa.w / 2;
-        if (leftEdge < CORNER_POST_MARGIN - 0.02 || rightEdge > wLen - CORNER_POST_MARGIN + 0.02) {
-          out.push({
-            id: 'corner_post_' + oa.id,
-            severity: 'error',
-            unitIds: [u.id],
-            text: `${name}: ${oa.label} on ${w} wall encroaches on ISO structural corner post (<0.22m)`,
-          });
-        }
-        for (let b = a + 1; b < wallOps.length; b++) {
-          const ob = wallOps[b];
-          const horizOverlap = Math.min(oa.along + oa.w / 2, ob.along + ob.w / 2) - Math.max(oa.along - oa.w / 2, ob.along - ob.w / 2);
-          const vertOverlap = Math.min(oa.sill + oa.h, ob.sill + ob.h) - Math.max(oa.sill, ob.sill);
-          if (horizOverlap > 0.02 && vertOverlap > 0.02) {
-            out.push({
-              id: 'op_overlap_' + oa.id + '_' + ob.id,
-              severity: 'error',
-              unitIds: [u.id],
-              text: `${name}: ${oa.label} and ${ob.label} overlap on ${w} wall — slide position in Detail`,
-            });
-          }
-        }
-      }
-
-      if (cutWidth > wLen * 0.68) {
-        out.push({
-          id: 'wall_cut_' + u.id + '_' + w,
-          severity: 'warn',
-          unitIds: [u.id],
-          text: `${name}: ${Math.round((cutWidth / wLen) * 100)}% of ${w} corrugated wall removed — portal frame steel required`,
-        });
-      }
-    }
-  }
-
-  return out;
+  return null;
 }
 
-const STORAGE_KEY = 'lime_constructs_project_v2';
+function normalizePlacedItem(raw: Partial<PlacedItem>, u: UnitModel, key: number): PlacedItem {
+  const type = raw.type || 'window';
+  const p = PART[type];
+  const kind = raw.kind || p?.kind || 'opening';
+  const it: PlacedItem = { ...raw, type, kind, key };
+  if (!p) return it;
+  if (it.kind === 'opening' || it.kind === 'facade') {
+    it.wall = WALLS.some((w) => w.id === it.wall) ? it.wall : 'left';
+    const span = wallSpan(u, it.wall!);
+    it.w = clamp(it.w ?? p.w, 0.1, span - 0.1);
+    it.h = clamp(it.h ?? p.h ?? 1, 0.05, it.kind === 'facade' ? u.hgt + 0.4 : u.hgt - 0.02);
+    it.sill = clamp(
+      it.sill ?? p.sill ?? 0,
+      it.kind === 'facade' ? -0.2 : 0,
+      Math.max(0, u.hgt - (it.kind === 'facade' ? 0.1 : it.h))
+    );
+    it.along = clamp(it.along ?? span / 2, it.w / 2, span - it.w / 2);
+    if (p.proj && it.proj == null) it.proj = p.proj;
+  } else if (it.kind === 'fitting') {
+    it.w = it.w ?? p.w;
+    it.d = it.d ?? p.d ?? 1;
+    it.h = it.h ?? p.h ?? 1;
+    it.rot = (((Number(it.rot) || 0) % 4) + 4) % 4;
+    if (p.deck && it.deck == null) it.deck = p.deck;
+    if (p.stair && it.type !== 'spiral-in' && raw.h == null) it.h = Math.min(it.h, u.hgt - 0.05);
+    const { dx, dz } = planSize(it);
+    it.x = clamp(it.x ?? u.len / 2, Math.min(dx / 2, u.len / 2), Math.max(u.len - dx / 2, u.len / 2));
+    it.z = clamp(it.z ?? u.wid / 2, Math.min(dz / 2, u.wid / 2), Math.max(u.wid - dz / 2, u.wid / 2));
+  } else if (it.kind === 'roof') {
+    const e = extOf(u);
+    it.w = Math.min(it.w ?? p.w, p.cover ? e.len + 0.6 : e.len);
+    it.d = Math.min(it.d ?? p.d ?? 1, p.cover ? e.wid + 0.6 : e.wid);
+    if (p.h && it.h == null) it.h = p.h;
+    it.x = clamp(it.x ?? u.len / 2, -0.5, u.len + 0.5);
+    it.z = clamp(it.z ?? u.wid / 2, -0.5, u.wid + 0.5);
+  }
+  return it;
+}
+
+function normalizeSiteItem(raw: Partial<PlacedItem>, key: number): PlacedItem {
+  const type = raw.type || 'deck';
+  const p = PART[type];
+  return {
+    ...raw,
+    type,
+    kind: 'site',
+    key,
+    w: raw.w ?? p?.w ?? 1,
+    d: raw.d ?? p?.d ?? 1,
+    h: raw.h ?? p?.h ?? 0.26,
+    rot: (((Number(raw.rot) || 0) % 4) + 4) % 4,
+    x: raw.x ?? 0,
+    z: raw.z ?? 0,
+    elev: raw.elev ?? 0,
+  };
+}
+
+function buildPresetData(p: PresetDef, startUnit = 1, startKey = 1) {
+  let nextUnit = startUnit;
+  let nextKey = startKey;
+  const units: UnitModel[] = [];
+  for (const pu of p.units) {
+    const t = UNIT_TYPE[pu.preset] || UNIT_TYPE['20ft'];
+    const u: UnitModel = {
+      id: `u${nextUnit++}`,
+      name: pu.name || '',
+      preset: t.id,
+      len: t.len,
+      wid: t.wid,
+      hgt: t.hgt,
+      cx: pu.cx,
+      cz: pu.cz,
+      rot: pu.rot || 0,
+      level: pu.level || 0,
+      color: pu.color || 'green',
+      items: [],
+    };
+    u.items = (pu.items || []).map((it) => normalizePlacedItem(it, u, nextKey++));
+    units.push(u);
+  }
+  const site = (p.site || []).map((it) => normalizeSiteItem(it, nextKey++));
+  return { name: p.name, units, site, nextUnit, nextKey };
+}
+
+function loadWebStorageJson<T>(key: string, fallback: T): T {
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed !== null && parsed !== undefined) return parsed as T;
+      }
+    } catch {}
+  }
+  return fallback;
+}
+
+type Snapshot = {
+  name: string;
+  units: UnitModel[];
+  site: PlacedItem[];
+};
 
 export function Planner() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
-  const wide = width >= 980;
-  const narrow = width < 450;
+  const isNarrow = width < 820;
 
-  const [units, setUnits] = useState<Unit[]>(PRESETS[1].units);
-  const [meta, setMeta] = useState<ProjectMeta>({
-    name: 'Container Build Concept',
-    client: '',
-    site: 'Lagos, NG',
-    currency: 'NGN',
-    notes: '',
-  });
-  const [selected, setSelected] = useState<string | null>(PRESETS[1].units[0]?.id || null);
-  const [mode, setMode] = useState<ViewMode>('3d');
-  const [cam, setCam] = useState<Cam>(camFor('3d'));
-  const [quote, setQuote] = useState(false);
-  const [tab, setTab] = useState<'build' | 'detail'>('build');
-  const [toast, setToast] = useState<string | null>(null);
-  const [history, setHistory] = useState<Unit[][]>([]);
-  const [future, setFuture] = useState<Unit[][]>([]);
-  const [showDimensions, setShowDimensions] = useState<boolean>(true);
-  const [imperial, setImperial] = useState<boolean>(false);
-  const [levelFilter, setLevelFilter] = useState<number | null>(null);
-  const [showWarnings, setShowWarnings] = useState<boolean>(false);
-  const [moveMode, setMoveMode] = useState<boolean>(false);
-  const unitsRef = React.useRef(units);
-  unitsRef.current = units;
-  const dragSnapshotRef = React.useRef<Unit[] | null>(null);
-
-  // Load saved project on web startup
-  useEffect(() => {
-    if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
-      try {
-        const raw = window.localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed.units) && parsed.units.length > 0) {
-            setUnits(parsed.units);
-            setSelected(parsed.units[0].id);
-          }
-          if (parsed.meta) setMeta((m) => ({ ...m, ...parsed.meta }));
-        }
-      } catch {}
+  const initialData = useMemo(() => {
+    const savedProj = loadWebStorageJson<any>(LS_PROJECT, null);
+    if (savedProj && Array.isArray(savedProj.units) && savedProj.units.length > 0) {
+      return {
+        name: savedProj.name || 'Untitled build',
+        units: savedProj.units as UnitModel[],
+        site: (Array.isArray(savedProj.site) ? savedProj.site : []) as PlacedItem[],
+        nextKey: Number(savedProj.nextKey) || 200,
+        nextUnit: Number(savedProj.nextUnit) || 50,
+        unit: (savedProj.unit === 'm' ? 'm' : 'ft') as 'ft' | 'm',
+        currency: (savedProj.currency || 'NGN') as CurrencyCode,
+        spec: { ...DEFAULT_SPEC, ...(savedProj.spec || {}) } as Record<string, string>,
+        services: (savedProj.services || {}) as Record<string, number>,
+        logistics: (savedProj.logistics || {}) as Record<string, number>,
+        overrides: (savedProj.overrides || {}) as Record<string, LineOverride>,
+        removed: (Array.isArray(savedProj.removed) ? savedProj.removed : []) as string[],
+        customLines: (Array.isArray(savedProj.customLines) ? savedProj.customLines : []) as CustomLine[],
+        commercial: { ...COMMERCIAL_DEFAULTS, discount: 0, ...(savedProj.commercial || {}) } as CommercialSettings,
+        showRoof: typeof savedProj.showRoof === 'boolean' ? savedProj.showRoof : true,
+      };
     }
+    const built = buildPresetData(PRESETS[0], 1, 1);
+    return {
+      name: built.name,
+      units: built.units,
+      site: built.site,
+      nextKey: built.nextKey,
+      nextUnit: built.nextUnit,
+      unit: 'ft' as 'ft' | 'm',
+      currency: 'NGN' as CurrencyCode,
+      spec: { ...DEFAULT_SPEC },
+      services: {} as Record<string, number>,
+      logistics: {} as Record<string, number>,
+      overrides: {} as Record<string, LineOverride>,
+      removed: [] as string[],
+      customLines: [] as CustomLine[],
+      commercial: { ...COMMERCIAL_DEFAULTS, discount: 0 } as CommercialSettings,
+      showRoof: true,
+    };
   }, []);
 
-  // Auto-save on web
+  const nextKeyRef = useRef(initialData.nextKey);
+  const nextUnitRef = useRef(initialData.nextUnit);
+
+  const prepItem = useCallback((raw: Partial<PlacedItem>, u: UnitModel): PlacedItem => {
+    return normalizePlacedItem(raw, u, nextKeyRef.current++);
+  }, []);
+
+  const prepSite = useCallback((raw: Partial<PlacedItem>): PlacedItem => {
+    return normalizeSiteItem(raw, nextKeyRef.current++);
+  }, []);
+
+  const mkUnit = useCallback((preset: string, cx = 0, cz = 0, o: Partial<UnitModel> = {}): UnitModel => {
+    const t = UNIT_TYPE[preset] || UNIT_TYPE['20ft'];
+    return {
+      id: `u${nextUnitRef.current++}`,
+      name: '',
+      preset: t.id,
+      len: t.len,
+      wid: t.wid,
+      hgt: t.hgt,
+      cx,
+      cz,
+      rot: 0,
+      level: 0,
+      color: 'green',
+      items: [],
+      ...o,
+    };
+  }, []);
+
+  const buildPresetState = useCallback(
+    (p: PresetDef) => {
+      const built = buildPresetData(p, nextUnitRef.current, nextKeyRef.current);
+      nextUnitRef.current = built.nextUnit;
+      nextKeyRef.current = built.nextKey;
+      return { name: built.name, units: built.units, site: built.site };
+    },
+    []
+  );
+
+  const [name, setName] = useState(initialData.name);
+  const [units, setUnits] = useState<UnitModel[]>(initialData.units);
+  const [site, setSite] = useState<PlacedItem[]>(initialData.site);
+  const [sel, setSel] = useState<SelRef>(null);
+  const [unitSystem, setUnitSystem] = useState<'ft' | 'm'>(initialData.unit);
+  const [currency, setCurrency] = useState<CurrencyCode>(initialData.currency);
+  const [showRoof, setShowRoof] = useState<boolean>(initialData.showRoof);
+  const [level, setLevel] = useState<'all' | number>('all');
+  const [viewName, setViewName] = useState<'iso' | 'top' | 'front' | 'left'>('iso');
+  const [cam, setCam] = useState<Cam>(CAM_VIEWS.iso);
+  const [fitTick, setFitTick] = useState(1);
+
+  const [spec, setSpec] = useState<Record<string, string>>(initialData.spec);
+  const [services, setServices] = useState<Record<string, number>>(initialData.services);
+  const [logistics, setLogistics] = useState<Record<string, number>>(initialData.logistics);
+  const [overrides, setOverrides] = useState<Record<string, LineOverride>>(initialData.overrides);
+  const [removed, setRemoved] = useState<string[]>(initialData.removed);
+  const [customLines, setCustomLines] = useState<CustomLine[]>(initialData.customLines);
+  const [customMaterials, setCustomMaterials] = useState<CustomMaterial[]>(() =>
+    loadWebStorageJson<CustomMaterial[]>(LS_MATERIALS, [])
+  );
+  const [rates, setRates] = useState<Partial<RateBook>>(() =>
+    loadWebStorageJson<Partial<RateBook>>(LS_RATES, {})
+  );
+  const [commercial, setCommercial] = useState<CommercialSettings>(initialData.commercial);
+  const [company, setCompany] = useState<CompanyMeta>(() => ({
+    name: '',
+    address: '',
+    phone: '',
+    email: '',
+    regNo: '',
+    client: '',
+    clientAddress: '',
+    quoteNo: `Q-${new Date().getFullYear()}-001`,
+    date: today(),
+    scope: '',
+    terms:
+      'Prices valid for 30 days. 70% deposit on order, balance on delivery.\nLead time 3–4 weeks from receipt of deposit.\nPrices subject to change if material costs move before order confirmation.',
+    ...loadWebStorageJson<Partial<CompanyMeta>>(LS_COMPANY, {}),
+  }));
+
+  const [tab, setTab] = useState<'design' | 'spec' | 'quote' | 'rates'>('design');
+  const [sideState, setSideState] = useState<'open' | 'closed'>(() => (isNarrow ? 'closed' : 'open'));
+  const [inspState, setInspState] = useState<'open' | 'closed' | 'peek'>(() => (isNarrow ? 'closed' : 'open'));
+  const [placeAt, setPlaceAt] = useState<PlaceTarget>(null);
+  const [clipboard, setClipboard] = useState<PlacedItem | null>(null);
+  const [presetsOpen, setPresetsOpen] = useState(false);
+  const [contextMenu, setContextMenu] = useState<ContextMenuConfig | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [dragStatus, setDragStatus] = useState<string | null>(null);
+  const [howOpenTick, setHowOpenTick] = useState(0);
+
+  const undoStackRef = useRef<Snapshot[]>([]);
+  const redoStackRef = useRef<Snapshot[]>([]);
+  const dragStartSnapRef = useRef<Snapshot | null>(null);
+  const stateRef = useRef({ name, units, site });
+
+  useEffect(() => {
+    stateRef.current = { name, units, site };
+  }, [name, units, site]);
+
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  // Save project on web
   useEffect(() => {
     if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
       try {
-        window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ units, meta }));
+        window.localStorage.setItem(
+          LS_PROJECT,
+          JSON.stringify({
+            name,
+            units,
+            site,
+            nextKey: nextKeyRef.current,
+            nextUnit: nextUnitRef.current,
+            unit: unitSystem,
+            currency,
+            spec,
+            services,
+            logistics,
+            overrides,
+            removed,
+            customLines,
+            commercial,
+            showRoof,
+          })
+        );
       } catch {}
     }
-  }, [units, meta]);
+  }, [name, units, site, unitSystem, currency, spec, services, logistics, overrides, removed, customLines, commercial, showRoof]);
 
-  const commit = useCallback((nextOrFn: Unit[] | ((prev: Unit[]) => Unit[])) => {
-    setUnits((prev) => {
-      const next = typeof nextOrFn === 'function' ? nextOrFn(prev) : nextOrFn;
-      setHistory((h) => [...h.slice(-30), prev]);
-      setFuture([]);
-      return next;
-    });
+  useEffect(() => {
+    if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
+      try {
+        window.localStorage.setItem(LS_RATES, JSON.stringify(rates));
+        window.localStorage.setItem(LS_COMPANY, JSON.stringify(company));
+        window.localStorage.setItem(LS_MATERIALS, JSON.stringify(customMaterials));
+      } catch {}
+    }
+  }, [rates, company, customMaterials]);
+
+  const checkpoint = useCallback(() => {
+    undoStackRef.current.push(clone(stateRef.current));
+    if (undoStackRef.current.length > 60) undoStackRef.current.shift();
+    redoStackRef.current = [];
   }, []);
 
   const undo = useCallback(() => {
-    setHistory((h) => {
-      if (!h.length) return h;
-      const prev = h[h.length - 1];
-      setFuture((f) => [unitsRef.current, ...f]);
-      setUnits(prev);
-      return h.slice(0, -1);
-    });
-  }, []);
-
-  const redo = useCallback(() => {
-    setFuture((f) => {
-      if (!f.length) return f;
-      const next = f[0];
-      setHistory((h) => [...h, unitsRef.current]);
-      setUnits(next);
-      return f.slice(1);
-    });
-  }, []);
-
-  // Web keyboard shortcuts for Undo / Redo / Delete
-  useEffect(() => {
-    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
-    const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault();
-        if (e.shiftKey) redo();
-        else undo();
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
-        e.preventDefault();
-        redo();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [undo, redo]);
-
-  const patch = useCallback(
-    (id: string, p: Partial<Unit>) => {
-      commit((prev) => prev.map((u) => (u.id === id ? { ...u, ...p } : u)));
-    },
-    [commit]
-  );
-
-  const handleDragStart = useCallback(() => {
-    dragSnapshotRef.current = unitsRef.current;
-  }, []);
-
-  const handleMoveUnit = useCallback((id: string, x: number, z: number) => {
-    setUnits((prev) => displaceUnits(id, x, z, prev));
-  }, []);
-
-  const handleDragEnd = useCallback(() => {
-    const snap = dragSnapshotRef.current;
-    dragSnapshotRef.current = null;
-    if (snap && snap !== unitsRef.current) {
-      setHistory((h) => [...h.slice(-30), snap]);
-      setFuture([]);
-    }
-  }, []);
-
-  const addUnit = (typeId: string) => {
-    // Fixed bug: calculate existing bounding box using each existing unit's own dimensions, and snap flush side-by-side!
-    const anchor = units.find((u) => u.id === selected) || units[units.length - 1];
-    let nextX = 0;
-    let nextZ = 0;
-    let nextLevel = 0;
-    if (anchor) {
-      const ab = unitBox(anchor);
-      nextX = anchor.x;
-      nextZ = Number((anchor.z + ab.W).toFixed(2));
-      nextLevel = anchor.level;
-    }
-    const u = makeUnit(typeId, nextX, nextZ, {
-      color: anchor?.color || 'charcoal',
-      level: nextLevel,
-      label: TYPE[typeId]?.short + ' #' + (units.length + 1),
-    });
-    commit([...units, u]);
-    setSelected(u.id);
-    if (!wide) setTab('detail');
-  };
-
-  const duplicate = () => {
-    const u = units.find((x) => x.id === selected);
-    if (!u) return;
-    const b = unitBox(u);
-    const copy: Unit = {
-      ...u,
-      id: makeUnit(u.type, 0, 0).id,
-      label: (u.label || TYPE[u.type].short) + ' copy',
-      x: u.x,
-      z: Number((u.z + b.W).toFixed(2)),
-      openings: u.openings.map((o) => ({ ...o, id: makeOpening(o.typeId || 'window', o.wall, o.along).id })),
-    };
-    commit([...units, copy]);
-    setSelected(copy.id);
-  };
-
-  const removeSelected = () => {
-    const remaining = units.filter((u) => u.id !== selected);
-    commit(remaining);
-    setSelected(remaining[0]?.id || null);
-  };
-
-  const addOpening = (typeId: string, wall: Wall) => {
-    const u = units.find((x) => x.id === selected);
-    if (!u) return;
-    const box = unitBox(u);
-    const wLen = wallLen(wall, box);
-    const ot = OPENING[typeId];
-    const min = ot.w / 2 + CORNER_POST_MARGIN;
-    const max = wLen - ot.w / 2 - CORNER_POST_MARGIN;
-
-    // Smart placement: find a free spot on the wall so multiple windows/doors don't stack on top of each other!
-    const existing = u.openings.filter((o) => o.wall === wall);
-    const candidates = [wLen / 2, wLen * 0.28, wLen * 0.72, min + 0.2, max - 0.2];
-    let chosen = Number((wLen / 2).toFixed(2));
-    for (const cPos of candidates) {
-      const clamped = Math.max(min, Math.min(max, cPos));
-      const collides = existing.some(
-        (ex) =>
-          Math.min(clamped + ot.w / 2, ex.along + ex.w / 2) - Math.max(clamped - ot.w / 2, ex.along - ex.w / 2) > 0.05 &&
-          Math.min(ot.sill + ot.h, ex.sill + ex.h) - Math.max(ot.sill, ex.sill) > 0.05
-      );
-      if (!collides) {
-        chosen = Number(clamped.toFixed(2));
-        break;
-      }
-    }
-
-    const o = makeOpening(typeId, wall, chosen);
-    patch(u.id, { openings: [...u.openings, o] });
-  };
-
-  const updateOpening = (opId: string, opPatch: Partial<Opening>) => {
-    if (!selected) return;
-    commit((prev) =>
-      prev.map((u) =>
-        u.id === selected
-          ? {
-              ...u,
-              openings: u.openings.map((o) => (o.id === opId ? { ...o, ...opPatch } : o)),
-            }
-          : u
-      )
-    );
-  };
-
-  const selectedUnit = units.find((u) => u.id === selected) || null;
-  const warnItems = useMemo(() => evaluateWarnings(units), [units]);
-  const warningUnitIds = useMemo(() => Array.from(new Set(warnItems.flatMap((w) => w.unitIds))), [warnItems]);
-  const money = useMemo(() => buildQuote(units), [units]);
-  const maxLevel = useMemo(() => (units.length ? Math.max(...units.map((u) => u.level)) : 0), [units]);
-
-  const toastFor = (msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 2000);
-  };
-
-  const setViewMode = (m: ViewMode) => {
-    setMode(m);
-    setCam(camFor(m));
-  };
-
-  const cycleLevelFilter = () => {
-    if (maxLevel === 0) {
-      setLevelFilter(null);
+    if (!undoStackRef.current.length) {
+      showToast('Nothing to undo');
       return;
     }
-    if (levelFilter === null) setLevelFilter(0);
-    else if (levelFilter < maxLevel) setLevelFilter(levelFilter + 1);
-    else setLevelFilter(null);
+    redoStackRef.current.push(clone(stateRef.current));
+    const prev = undoStackRef.current.pop()!;
+    setName(prev.name);
+    setUnits(prev.units);
+    setSite(prev.site);
+  }, [showToast]);
+
+  const redo = useCallback(() => {
+    if (!redoStackRef.current.length) {
+      showToast('Nothing to redo');
+      return;
+    }
+    undoStackRef.current.push(clone(stateRef.current));
+    const next = redoStackRef.current.pop()!;
+    setName(next.name);
+    setUnits(next.units);
+    setSite(next.site);
+  }, [showToast]);
+
+  const layout = useMemo(() => layoutUnits(units), [units]);
+  const topLevel = useMemo(() => Math.max(0, ...units.map((u) => u.level || 0)), [units]);
+
+  const quoteResult = useMemo(
+    () =>
+      buildQuote(
+        { units, site, spec, services, logistics, customMaterials, customLines, commercial },
+        rates,
+        { overrides, removed }
+      ),
+    [units, site, spec, services, logistics, customMaterials, customLines, commercial, rates, overrides, removed]
+  );
+
+  const selectRef = useCallback(
+    (ref: SelRef) => {
+      setSel(ref);
+      if (ref && isNarrow) {
+        setInspState((prev) => (prev === 'closed' ? 'peek' : prev));
+      } else if (!ref && isNarrow) {
+        setInspState('closed');
+      }
+    },
+    [isNarrow]
+  );
+
+  const targetUnit = useCallback(() => {
+    if (sel?.t === 'unit' || sel?.t === 'item') {
+      return units.find((u) => u.id === sel.id) || units[units.length - 1];
+    }
+    return units[units.length - 1];
+  }, [sel, units]);
+
+  const addUnit = useCallback(
+    (preset: string, at: { x?: number; z?: number; level?: number } | null = null) => {
+      checkpoint();
+      const target = targetUnit();
+      let cx = at?.x;
+      let cz = at?.z;
+      const lv = at?.level ?? 0;
+      const u = mkUnit(preset, 0, 0, { color: target?.color || 'green' });
+      if (cx == null || cz == null) {
+        const ground = units.filter((x) => (x.level || 0) === 0);
+        if (ground.length) {
+          const r = ground.map(unitRect).reduce((a, b) => ({
+            z1: Math.max(a.z1, b.z1),
+            x0: Math.min(a.x0, b.x0),
+            x1: Math.max(a.x1, b.x1),
+            z0: Math.min(a.z0, b.z0),
+          }));
+          const e = extOf(u);
+          cx = r.x0 + e.len / 2;
+          cz = r.z1 + e.wid / 2;
+        } else {
+          cx = 0;
+          cz = 0;
+        }
+      }
+      u.cx = r3(cx);
+      u.cz = r3(cz);
+      u.level = lv;
+      setUnits((prev) => [...prev, u]);
+      selectRef({ t: 'unit', id: u.id });
+      showToast(`${unitName(u)} added${lv ? ` on ${levelName(lv).toLowerCase()}` : ''}`);
+      if (isNarrow) setSideState('closed');
+    },
+    [checkpoint, targetUnit, mkUnit, units, selectRef, showToast, isNarrow]
+  );
+
+  const addPart = useCallback(
+    (type: string, at: PlaceTarget = placeAt) => {
+      const p = PART[type];
+      if (!p) return;
+      checkpoint();
+      if (p.kind === 'site' || (p.siteOk && at?.kind === 'site')) {
+        const u = targetUnit();
+        let x = at?.x;
+        let z = at?.z;
+        if (x == null || z == null) {
+          if (u) {
+            const r = unitRect(u);
+            x = u.cx;
+            z = r.z0 - (p.d || 1) / 2 - 0.4;
+          } else {
+            x = 0;
+            z = 0;
+          }
+        }
+        const it = prepSite({
+          type,
+          x: r3(x),
+          z: r3(z),
+          rot: 0,
+          ...(p.stair && u ? { h: r3(BASE_Y + (layout.get(u.id)?.elev || 0) + extOf(u).hgt) } : {}),
+        });
+        setSite((prev) => [...prev, it]);
+        selectRef({ t: 'site', key: it.key });
+      } else {
+        const u = (at?.unitId ? units.find((x) => x.id === at.unitId) : null) || targetUnit();
+        if (!u) {
+          undoStackRef.current.pop();
+          showToast('Add a container first.');
+          return;
+        }
+        let raw: Partial<PlacedItem> = { kind: p.kind, type };
+        if (p.kind === 'opening' || p.kind === 'facade') {
+          let wall: WallId | undefined = at?.wall;
+          if (!wall) {
+            wall =
+              /door|garage|roller|fold/.test(type) && !u.items.some((i) => i.kind === 'opening' && i.wall === 'front')
+                ? 'front'
+                : 'left';
+          }
+          const w = Math.min(p.w, wallSpan(u, wall) - 0.2);
+          let along: number | null = at?.along ?? freeAlong(u, wall, w);
+          if (along == null) {
+            for (const alt of ['right', 'left', 'back', 'front'] as WallId[]) {
+              const a = freeAlong(u, alt, Math.min(p.w, wallSpan(u, alt) - 0.2));
+              if (a != null) {
+                wall = alt;
+                along = a;
+                break;
+              }
+            }
+          }
+          raw = { ...raw, wall, along: along ?? wallSpan(u, wall) / 2 };
+        } else if (p.kind === 'fitting') {
+          raw = {
+            ...raw,
+            x: at?.x ?? u.len / 2,
+            z: at?.z ?? u.wid / 2,
+            rot: p.isWall ? 0 : p.w > u.wid - 0.3 ? 1 : 0,
+          };
+          if (p.isWall && p.d) raw.d = Math.min(p.d, u.wid);
+          if (p.id === 'mezzanine') {
+            raw.x = at?.x ?? 1.25;
+            raw.d = u.wid;
+            raw.deck = clamp(u.hgt - 0.9, 1.4, 2.2);
+          }
+        } else if (p.kind === 'roof') {
+          raw = { ...raw, x: at?.x ?? u.len / 2, z: at?.z ?? u.wid / 2 };
+          if (p.cover) {
+            raw.x = u.len / 2;
+            raw.z = u.wid / 2;
+          }
+          if (['roof-deck', 'green-roof', 'solar'].includes(type) && at?.x == null) {
+            raw.w = Math.min(p.w, extOf(u).len - 0.2);
+          }
+        }
+        const it = prepItem(raw, u);
+        setUnits((prev) => prev.map((x) => (x.id === u.id ? { ...x, items: [...x.items, it] } : x)));
+        selectRef({ t: 'item', id: u.id, key: it.key });
+        if (p.kind === 'roof' && !showRoof) {
+          setShowRoof(true);
+          showToast('Roof shown so you can see it');
+        }
+        if (p.kind === 'fitting' && showRoof && !(layout.get(u.id) && layout.get(u.id)!.covered > 0.5)) {
+          setShowRoof(false);
+          showToast('Roof hidden to show the inside');
+        }
+      }
+      setPlaceAt(null);
+      if (isNarrow) setSideState('closed');
+    },
+    [placeAt, checkpoint, targetUnit, prepSite, layout, selectRef, units, showToast, prepItem, showRoof, isNarrow]
+  );
+
+  const stackOn = useCallback(
+    (u: UnitModel) => {
+      checkpoint();
+      const n = mkUnit(u.preset, u.cx, u.cz, {
+        rot: u.rot,
+        level: (u.level || 0) + 1,
+        color: u.color,
+      });
+      setUnits((prev) => [...prev, n]);
+      selectRef({ t: 'unit', id: n.id });
+      setShowRoof(true);
+      showToast('Stacked corner to corner');
+    },
+    [checkpoint, mkUnit, selectRef, showToast]
+  );
+
+  const duplicateUnit = useCallback(
+    (u: UnitModel) => {
+      checkpoint();
+      const e = extOf(u);
+      const turned = (u.rot || 0) % 2;
+      const n: UnitModel = {
+        ...clone(u),
+        id: `u${nextUnitRef.current++}`,
+        name: '',
+        cx: r3(turned ? u.cx + e.wid : u.cx),
+        cz: r3(turned ? u.cz : u.cz + e.wid),
+        items: u.items.map((it) => ({ ...clone(it), key: nextKeyRef.current++ })),
+      };
+      setUnits((prev) => [...prev, n]);
+      selectRef({ t: 'unit', id: n.id });
+    },
+    [checkpoint, selectRef]
+  );
+
+  const duplicateSel = useCallback(() => {
+    if (!sel) return;
+    if (sel.t === 'unit') {
+      const u = units.find((x) => x.id === sel.id);
+      if (u) duplicateUnit(u);
+      return;
+    }
+    if (sel.t === 'site') {
+      const s = site.find((x) => x.key === sel.key);
+      if (!s) return;
+      checkpoint();
+      const it: PlacedItem = {
+        ...clone(s),
+        key: nextKeyRef.current++,
+        x: r3((s.x ?? 0) + 0.5),
+        z: r3((s.z ?? 0) + 0.5),
+      };
+      setSite((prev) => [...prev, it]);
+      selectRef({ t: 'site', key: it.key });
+      return;
+    }
+    if (sel.t === 'item') {
+      const u = units.find((x) => x.id === sel.id);
+      const orig = u?.items.find((x) => x.key === sel.key);
+      if (!u || !orig) return;
+      checkpoint();
+      const it: PlacedItem = { ...clone(orig), key: nextKeyRef.current++ };
+      if (it.kind === 'opening' || it.kind === 'facade') {
+        const w = it.w ?? PART[it.type]?.w ?? 1;
+        const a = freeAlong(u, it.wall || 'left', w);
+        const span = wallSpan(u, it.wall || 'left');
+        it.along = a != null ? a : clamp((it.along ?? span / 2) + w + 0.3, w / 2, span - w / 2);
+      } else {
+        it.x = clamp(r3((it.x ?? u.len / 2) + 0.4), 0, u.len);
+        it.z = clamp(r3(it.z ?? u.wid / 2), 0, u.wid);
+      }
+      setUnits((prev) => prev.map((x) => (x.id === u.id ? { ...x, items: [...x.items, it] } : x)));
+      selectRef({ t: 'item', id: u.id, key: it.key });
+    }
+  }, [sel, units, site, duplicateUnit, checkpoint, selectRef]);
+
+  const removeSel = useCallback(() => {
+    if (!sel) return;
+    checkpoint();
+    if (sel.t === 'unit') {
+      const u = units.find((x) => x.id === sel.id);
+      if (!u) return;
+      const above = units.filter((x) => (layout.get(x.id)?.below || []).includes(u.id));
+      setUnits((prev) => prev.filter((x) => x.id !== u.id));
+      if (above.length) {
+        showToast(
+          `${above.length} unit${above.length > 1 ? 's' : ''} above now ${
+            above.length > 1 ? 'have' : 'has'
+          } nothing under ${above.length > 1 ? 'them' : 'it'}`
+        );
+      }
+    } else if (sel.t === 'site') {
+      setSite((prev) => prev.filter((i) => i.key !== sel.key));
+    } else if (sel.t === 'item') {
+      setUnits((prev) =>
+        prev.map((u) => (u.id === sel.id ? { ...u, items: u.items.filter((i) => i.key !== sel.key) } : u))
+      );
+    }
+    selectRef(null);
+  }, [sel, checkpoint, units, layout, showToast, selectRef]);
+
+  const rotateSel = useCallback(
+    (dir = 1) => {
+      if (!sel) return;
+      checkpoint();
+      if (sel.t === 'unit') {
+        setUnits((prev) =>
+          prev.map((u) => (u.id === sel.id ? { ...u, rot: (((u.rot || 0) + dir) % 4 + 4) % 4 } : u))
+        );
+        return;
+      }
+      if (sel.t === 'site') {
+        setSite((prev) =>
+          prev.map((it) => (it.key === sel.key ? { ...it, rot: (((it.rot || 0) + dir) % 4 + 4) % 4 } : it))
+        );
+        return;
+      }
+      if (sel.t === 'item') {
+        setUnits((prev) =>
+          prev.map((u) => {
+            if (u.id !== sel.id) return u;
+            return {
+              ...u,
+              items: u.items.map((it) => {
+                if (it.key !== sel.key) return it;
+                if (it.kind === 'opening' || it.kind === 'facade') {
+                  const order: WallId[] = ['front', 'right', 'back', 'left'];
+                  const nextWall = order[(order.indexOf(it.wall || 'left') + (dir > 0 ? 1 : 3)) % 4];
+                  const nextW = Math.min(it.w ?? PART[it.type]?.w ?? 1, wallSpan(u, nextWall) - 0.2);
+                  const nextAlong = freeAlong(u, nextWall, nextW) ?? wallSpan(u, nextWall) / 2;
+                  return { ...it, wall: nextWall, w: nextW, along: nextAlong };
+                }
+                if (it.kind === 'roof') {
+                  const e = extOf(u);
+                  return {
+                    ...it,
+                    w: Math.min(it.d ?? 1, e.len + 0.6),
+                    d: Math.min(it.w ?? 1, e.wid + 0.6),
+                  };
+                }
+                const nextRot = (((it.rot || 0) + dir) % 4 + 4) % 4;
+                const { dx, dz } = planSize({ ...it, rot: nextRot });
+                return {
+                  ...it,
+                  rot: nextRot,
+                  x: clamp(it.x ?? u.len / 2, dx / 2, Math.max(dx / 2, u.len - dx / 2)),
+                  z: clamp(it.z ?? u.wid / 2, dz / 2, Math.max(dz / 2, u.wid - dz / 2)),
+                };
+              }),
+            };
+          })
+        );
+      }
+    },
+    [sel, checkpoint]
+  );
+
+  const nudgeSel = useCallback(
+    (dx: number, dz: number) => {
+      if (!sel) return;
+      if (sel.t === 'unit') {
+        setUnits((prev) =>
+          prev.map((u) => (u.id === sel.id ? { ...u, cx: r3(u.cx + dx), cz: r3(u.cz + dz) } : u))
+        );
+      } else if (sel.t === 'site') {
+        setSite((prev) =>
+          prev.map((it) =>
+            it.key === sel.key ? { ...it, x: r3((it.x ?? 0) + dx), z: r3((it.z ?? 0) + dz) } : it
+          )
+        );
+      } else if (sel.t === 'item') {
+        setUnits((prev) =>
+          prev.map((u) => {
+            if (u.id !== sel.id) return u;
+            return {
+              ...u,
+              items: u.items.map((it) => {
+                if (it.key !== sel.key) return it;
+                if (it.kind === 'opening' || it.kind === 'facade') {
+                  const span = wallSpan(u, it.wall || 'left');
+                  const w = it.w ?? PART[it.type]?.w ?? 1;
+                  return {
+                    ...it,
+                    along: clamp(r3((it.along ?? span / 2) + (dx || dz)), w / 2, span - w / 2),
+                  };
+                }
+                const r = ((u.rot || 0) % 4 + 4) % 4;
+                const [lx, lz] = (
+                  [
+                    [dx, dz],
+                    [dz, -dx],
+                    [-dx, -dz],
+                    [-dz, dx],
+                  ] as [number, number][]
+                )[r];
+                return {
+                  ...it,
+                  x: r3((it.x ?? u.len / 2) + lx),
+                  z: r3((it.z ?? u.wid / 2) + lz),
+                };
+              }),
+            };
+          })
+        );
+      }
+    },
+    [sel]
+  );
+
+  const copySel = useCallback(() => {
+    if (!sel || sel.t === 'unit') return;
+    if (sel.t === 'site') {
+      const it = site.find((x) => x.key === sel.key);
+      if (it) {
+        setClipboard(clone(it));
+        showToast(`${PART[it.type]?.name || 'Part'} copied`);
+      }
+    } else if (sel.t === 'item') {
+      const u = units.find((x) => x.id === sel.id);
+      const it = u?.items.find((x) => x.key === sel.key);
+      if (it) {
+        setClipboard(clone(it));
+        showToast(`${PART[it.type]?.name || 'Part'} copied`);
+      }
+    }
+  }, [sel, site, units, showToast]);
+
+  const pasteClipboard = useCallback(
+    (u?: UnitModel | null, at?: PlaceTarget) => {
+      if (!clipboard) return;
+      if (clipboard.kind === 'site') {
+        checkpoint();
+        const it: PlacedItem = {
+          ...clone(clipboard),
+          key: nextKeyRef.current++,
+          x: r3(at?.x ?? (clipboard.x ?? 0) + 0.5),
+          z: r3(at?.z ?? (clipboard.z ?? 0) + 0.5),
+        };
+        setSite((prev) => [...prev, it]);
+        selectRef({ t: 'site', key: it.key });
+        return;
+      }
+      const target = u || targetUnit();
+      if (!target) return;
+      checkpoint();
+      const it = prepItem(
+        {
+          ...clone(clipboard),
+          ...(at?.kind === 'floor' && clipboard.kind === 'fitting' ? { x: at.x, z: at.z } : {}),
+          ...(at?.kind === 'wall' && (clipboard.kind === 'opening' || clipboard.kind === 'facade')
+            ? { wall: at.wall, along: at.along }
+            : {}),
+        },
+        target
+      );
+      if ((it.kind === 'opening' || it.kind === 'facade') && !at) {
+        it.along = freeAlong(target, it.wall || 'left', it.w ?? 1) ?? it.along;
+      }
+      setUnits((prev) => prev.map((x) => (x.id === target.id ? { ...x, items: [...x.items, it] } : x)));
+      selectRef({ t: 'item', id: target.id, key: it.key });
+    },
+    [clipboard, checkpoint, selectRef, targetUnit, prepItem]
+  );
+
+  const toggleRoof = useCallback(() => {
+    setShowRoof((prev) => {
+      const next = !prev;
+      showToast(next ? 'Roofs shown' : 'Roofs hidden — look inside');
+      return next;
+    });
+  }, [showToast]);
+
+  const frameAll = useCallback(() => {
+    setViewName('iso');
+    setCam(CAM_VIEWS.iso);
+    setFitTick((t) => t + 1);
+  }, []);
+
+  const setView = useCallback((v: 'iso' | 'top' | 'front' | 'left') => {
+    setViewName(v);
+    setCam(CAM_VIEWS[v]);
+    if (v === 'iso') setFitTick((t) => t + 1);
+  }, []);
+
+  const loadPreset = useCallback(
+    (p: PresetDef) => {
+      checkpoint();
+      const next = buildPresetState(p);
+      setName(next.name);
+      setUnits(next.units);
+      setSite(next.site);
+      setSel(null);
+      setShowRoof(true);
+      setLevel('all');
+      setOverrides({});
+      setRemoved([]);
+      setFitTick((t) => t + 1);
+      showToast(`${p.name} loaded`);
+    },
+    [checkpoint, buildPresetState, showToast]
+  );
+
+  // Keyboard shortcuts on Web
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+      const mod = e.metaKey || e.ctrlKey;
+      if (e.key === 'Escape') {
+        if (presetsOpen) {
+          setPresetsOpen(false);
+          return;
+        }
+        if (contextMenu) {
+          setContextMenu(null);
+          return;
+        }
+        if (placeAt) {
+          setPlaceAt(null);
+          return;
+        }
+        if (sel) {
+          selectRef(null);
+          return;
+        }
+      }
+      if (typing) return;
+      if (tab !== 'design' && !mod) return;
+      const k = e.key.toLowerCase();
+      if (mod && k === 'z') {
+        e.preventDefault();
+        return e.shiftKey ? redo() : undo();
+      }
+      if (mod && k === 'y') {
+        e.preventDefault();
+        return redo();
+      }
+      if (tab !== 'design') return;
+      if (mod && k === 'd') {
+        e.preventDefault();
+        return duplicateSel();
+      }
+      if (mod && k === 'c') {
+        e.preventDefault();
+        return copySel();
+      }
+      if (mod && k === 'v') {
+        e.preventDefault();
+        const u = sel?.t === 'unit' || sel?.t === 'item' ? units.find((x) => x.id === sel.id) : null;
+        return pasteClipboard(u);
+      }
+      if (mod) return;
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (sel) {
+          e.preventDefault();
+          removeSel();
+        }
+        return;
+      }
+      if (k === 'r') return rotateSel(e.shiftKey ? -1 : 1);
+      if (k === 'f') return frameAll();
+      if (['1', '2', '3', '4'].includes(e.key)) {
+        const v = (['iso', 'top', 'front', 'left'] as const)[Number(e.key) - 1];
+        setView(v);
+        return;
+      }
+      const step = e.shiftKey ? 0.25 : 0.05;
+      const arrows: Record<string, [number, number]> = {
+        ArrowLeft: [-step, 0],
+        ArrowRight: [step, 0],
+        ArrowUp: [0, -step],
+        ArrowDown: [0, step],
+      };
+      if (arrows[e.key] && sel) {
+        e.preventDefault();
+        if (!e.repeat) checkpoint();
+        nudgeSel(...arrows[e.key]);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    presetsOpen,
+    contextMenu,
+    placeAt,
+    sel,
+    tab,
+    undo,
+    redo,
+    duplicateSel,
+    copySel,
+    pasteClipboard,
+    units,
+    removeSel,
+    rotateSel,
+    frameAll,
+    setView,
+    checkpoint,
+    nudgeSel,
+    selectRef,
+  ]);
+
+  // Context menu builder on 3D canvas
+  const handleCanvasContextMenu = useCallback(
+    (screenX: number, screenY: number, hit: HitResult) => {
+      if (hit.ref) selectRef(hit.ref);
+      const items: ContextMenuItem[] = [];
+      const placeHere = (at: PlaceTarget, list: string[], label: string) => {
+        items.push({ heading: label });
+        for (const t of list) {
+          if (PART[t]) {
+            items.push({ label: PART[t].name, icon: 'plus', action: () => addPart(t, at) });
+          }
+        }
+        items.push({
+          label: 'More parts here…',
+          icon: 'place',
+          action: () => {
+            setPlaceAt(at);
+            setSideState('open');
+          },
+        });
+      };
+
+      if (hit.ref?.t === 'item' || hit.ref?.t === 'site') {
+        const hitRef = hit.ref;
+        const isSite = hitRef.t === 'site';
+        const u = !isSite ? units.find((x) => x.id === hitRef.id) : undefined;
+        const it = isSite
+          ? site.find((x) => x.key === hitRef.key)
+          : u?.items.find((x) => x.key === hitRef.key);
+        if (!it) return;
+        const p = PART[it.type];
+        items.push({
+          label: 'Properties',
+          icon: 'info',
+          shortcut: '↵',
+          action: () => setInspState('open'),
+        });
+        items.push({ label: 'Duplicate', icon: 'copy', shortcut: 'Ctrl D', action: duplicateSel });
+        if ((it.kind === 'opening' || it.kind === 'facade') && u) {
+          items.push({ heading: 'Move to wall' });
+          for (const w of WALLS) {
+            if (w.id !== it.wall) {
+              items.push({
+                label: w.name,
+                action: () => {
+                  checkpoint();
+                  const nextW = Math.min(it.w ?? p?.w ?? 1, wallSpan(u, w.id) - 0.2);
+                  const nextAlong = freeAlong(u, w.id, nextW) ?? wallSpan(u, w.id) / 2;
+                  setUnits((prev) =>
+                    prev.map((x) =>
+                      x.id === u.id
+                        ? {
+                            ...x,
+                            items: x.items.map((item) =>
+                              item.key === it.key ? { ...item, wall: w.id, w: nextW, along: nextAlong } : item
+                            ),
+                          }
+                        : x
+                    )
+                  );
+                },
+              });
+            }
+          }
+          items.push({
+            label: 'Centre on this wall',
+            action: () => {
+              checkpoint();
+              const centered = wallSpan(u, it.wall || 'left') / 2;
+              setUnits((prev) =>
+                prev.map((x) =>
+                  x.id === u.id
+                    ? {
+                        ...x,
+                        items: x.items.map((item) => (item.key === it.key ? { ...item, along: centered } : item)),
+                      }
+                    : x
+                )
+              );
+            },
+          });
+        } else {
+          items.push({ label: 'Turn 90°', icon: 'rotate', shortcut: 'R', action: () => rotateSel(1) });
+        }
+        if (p?.how) {
+          items.push({
+            label: 'How it’s built',
+            icon: 'info',
+            action: () => {
+              setInspState('open');
+              setHowOpenTick((t) => t + 1);
+            },
+          });
+        }
+        items.push({ label: 'Copy', shortcut: 'Ctrl C', action: copySel });
+        items.push({ separator: true });
+        items.push({ label: 'Delete', icon: 'trash', shortcut: 'Del', destructive: true, action: removeSel });
+        setContextMenu({ x: screenX, y: screenY, title: p?.name || 'Part', items });
+        return;
+      }
+
+      if (hit.ref?.t === 'unit') {
+        const u = units.find((x) => x.id === (hit.ref as { id: string }).id);
+        if (!u) return;
+        const at = placementAt(hit, null, units);
+        if (at?.kind === 'floor' && at.wall) {
+          const elev = layout.get(u.id)?.elev || 0;
+          const lp = worldToUnitLocal(hit.point, u, elev);
+          const along = r3(
+            at.wall === 'left'
+              ? lp[0] + u.len / 2
+              : at.wall === 'right'
+              ? u.len / 2 - lp[0]
+              : at.wall === 'front'
+              ? lp[2] + u.wid / 2
+              : u.wid / 2 - lp[2]
+          );
+          const wName = WALLS.find((w) => w.id === at.wall)?.name.toLowerCase() || 'wall';
+          placeHere({ kind: 'wall', unitId: u.id, wall: at.wall, along }, quickParts.wall, `Add to the ${wName}`);
+        } else if (at?.kind === 'roof') {
+          placeHere(at, quickParts.roof, 'Add to the roof');
+        } else if (at) {
+          placeHere(at, quickParts.floor, 'Add here');
+        }
+        items.push({ separator: true });
+        items.push({ heading: unitName(u) });
+        items.push({ label: 'Stack a unit on top', icon: 'stack', action: () => stackOn(u) });
+        items.push({ label: 'Duplicate alongside', icon: 'copy', shortcut: 'Ctrl D', action: () => duplicateUnit(u) });
+        items.push({
+          label: 'Turn 90°',
+          icon: 'rotate',
+          shortcut: 'R',
+          action: () => {
+            selectRef({ t: 'unit', id: u.id });
+            rotateSel(1);
+          },
+        });
+        items.push({ label: showRoof ? 'Hide roofs' : 'Show roofs', icon: 'roof', action: toggleRoof });
+        if (clipboard && clipboard.kind !== 'site') {
+          items.push({ label: 'Paste into this unit', shortcut: 'Ctrl V', action: () => pasteClipboard(u, at) });
+        }
+        items.push({ separator: true });
+        items.push({
+          label: 'Remove unit',
+          icon: 'trash',
+          destructive: true,
+          action: () => {
+            selectRef({ t: 'unit', id: u.id });
+            removeSel();
+          },
+        });
+        setContextMenu({
+          x: screenX,
+          y: screenY,
+          title: `${unitName(u)} · ${levelName(u.level || 0)}`,
+          items,
+        });
+        return;
+      }
+
+      // Site / ground hit
+      const at: PlaceTarget = { kind: 'site', x: r3(hit.point[0]), z: r3(hit.point[2]) };
+      items.push({ heading: 'Add a unit here' });
+      for (const id of ['20ft', '40ft', '40hc', 'pc20'] as const) {
+        items.push({
+          label: UNIT_TYPE[id].name,
+          icon: 'box',
+          action: () => addUnit(id, { x: at.x, z: at.z }),
+        });
+      }
+      placeHere(at, quickParts.site, 'Add to the site');
+      items.push({ separator: true });
+      if (clipboard?.kind === 'site') {
+        items.push({ label: 'Paste here', shortcut: 'Ctrl V', action: () => pasteClipboard(null, at) });
+      }
+      items.push({ label: 'Start from a design…', icon: 'grid', action: () => setPresetsOpen(true) });
+      items.push({ label: 'Fit view', icon: 'fit', shortcut: 'F', action: frameAll });
+      items.push({ label: showRoof ? 'Hide roofs' : 'Show roofs', icon: 'roof', action: toggleRoof });
+      setContextMenu({ x: screenX, y: screenY, title: 'Site', items });
+    },
+    [
+      selectRef,
+      addPart,
+      units,
+      site,
+      duplicateSel,
+      checkpoint,
+      rotateSel,
+      copySel,
+      removeSel,
+      layout,
+      stackOn,
+      duplicateUnit,
+      showRoof,
+      toggleRoof,
+      clipboard,
+      pasteClipboard,
+      addUnit,
+      frameAll,
+    ]
+  );
+
+  const openMoreMenu = () => {
+    setContextMenu({
+      x: width - 260,
+      y: 56,
+      title: 'Build',
+      items: [
+        { label: 'Start from a design…', icon: 'grid', action: () => setPresetsOpen(true) },
+        {
+          label: 'New empty build',
+          icon: 'plus',
+          action: () => {
+            checkpoint();
+            setUnits([]);
+            setSite([]);
+            setName('Untitled build');
+            setSel(null);
+            frameAll();
+            showToast('New empty build');
+          },
+        },
+        { separator: true },
+        {
+          label: unitSystem === 'ft' ? 'Measure in metres' : 'Measure in feet',
+          action: () => setUnitSystem((u) => (u === 'ft' ? 'm' : 'ft')),
+        },
+        { label: showRoof ? 'Hide roofs' : 'Show roofs', icon: 'roof', action: toggleRoof },
+        { label: 'Fit view', icon: 'fit', shortcut: 'F', action: frameAll },
+        { separator: true },
+        {
+          heading:
+            'Keys: click select · drag selected to move · R turn · Del delete · Ctrl D duplicate · arrows nudge · 1–4 views · F fit',
+        },
+      ],
+    });
   };
 
+  // Inspector callbacks
+  const handleUpdateUnit = useCallback(
+    (id: string, patch: Partial<UnitModel>) => {
+      checkpoint();
+      if (patch.level !== undefined) setShowRoof(true);
+      setUnits((prev) => prev.map((u) => (u.id === id ? { ...u, ...patch } : u)));
+    },
+    [checkpoint]
+  );
+
+  const handleChangeUnitPreset = useCallback(
+    (id: string, preset: string) => {
+      const t = UNIT_TYPE[preset];
+      if (!t) return;
+      checkpoint();
+      setUnits((prev) =>
+        prev.map((u) => {
+          if (u.id !== id) return u;
+          const updated: UnitModel = { ...u, preset: t.id, len: t.len, wid: t.wid, hgt: t.hgt };
+          updated.items = updated.items.map((it) => prepItem({ ...it }, updated));
+          return updated;
+        })
+      );
+    },
+    [checkpoint, prepItem]
+  );
+
+  const handleUpdateItem = useCallback(
+    (ref: SelRef, patch: Partial<PlacedItem>) => {
+      if (!ref) return;
+      checkpoint();
+      if (ref.t === 'site') {
+        setSite((prev) => prev.map((it) => (it.key === ref.key ? { ...it, ...patch } : it)));
+      } else if (ref.t === 'item') {
+        setUnits((prev) =>
+          prev.map((u) => {
+            if (u.id !== ref.id) return u;
+            return {
+              ...u,
+              items: u.items.map((it) => {
+                if (it.key !== ref.key) return it;
+                const next = { ...it, ...patch };
+                if (next.kind === 'opening' || next.kind === 'facade') {
+                  const span = wallSpan(u, next.wall || 'left');
+                  next.w = clamp(next.w ?? 1, 0.1, span - 0.1);
+                  next.h = clamp(next.h ?? 1, 0.05, next.kind === 'facade' ? u.hgt + 0.4 : u.hgt - 0.02);
+                  if (next.kind === 'opening') {
+                    next.sill = clamp(next.sill ?? 0, 0, Math.max(0, u.hgt - next.h));
+                  }
+                  next.along = clamp(next.along ?? span / 2, next.w / 2, span - next.w / 2);
+                }
+                if (next.kind === 'fitting' && next.deck != null) {
+                  next.deck = clamp(next.deck, 1.0, u.hgt - 0.3);
+                }
+                return next;
+              }),
+            };
+          })
+        );
+      }
+    },
+    [checkpoint]
+  );
+
+  const handleChangeItemWall = useCallback(
+    (unitId: string, itemKey: number, wall: WallId) => {
+      checkpoint();
+      setUnits((prev) =>
+        prev.map((u) => {
+          if (u.id !== unitId) return u;
+          return {
+            ...u,
+            items: u.items.map((it) => {
+              if (it.key !== itemKey) return it;
+              const nextW = Math.min(it.w ?? PART[it.type]?.w ?? 1, wallSpan(u, wall) - 0.2);
+              const nextAlong = freeAlong(u, wall, nextW) ?? wallSpan(u, wall) / 2;
+              return { ...it, wall, w: nextW, along: nextAlong };
+            }),
+          };
+        })
+      );
+    },
+    [checkpoint]
+  );
+
+  // Status bar text
+  const statusSelText = useMemo(() => {
+    if (dragStatus) return dragStatus;
+    if (!sel) return placeAt ? 'Choose a part to place' : 'Nothing selected — right-click or long-press for actions';
+    if (sel.t === 'unit') {
+      const u = units.find((x) => x.id === sel.id);
+      if (!u) return 'Nothing selected';
+      return `${unitName(u)} · ${levelName(u.level || 0)} · ${u.items.length} parts`;
+    }
+    if (sel.t === 'site') {
+      const it = site.find((x) => x.key === sel.key);
+      return `${PART[it?.type || '']?.name || 'Part'} · site`;
+    }
+    if (sel.t === 'item') {
+      const u = units.find((x) => x.id === sel.id);
+      const it = u?.items.find((x) => x.key === sel.key);
+      if (!u || !it) return 'Nothing selected';
+      const p = PART[it.type];
+      if (it.kind === 'opening' || it.kind === 'facade') {
+        const wName = WALLS.find((w) => w.id === it.wall)?.name || '';
+        return `${p?.name} · ${wName} · ${fmtLen(it.along ?? 0, unitSystem)} along`;
+      }
+      return `${p?.name} · ${unitName(u)}`;
+    }
+    return '';
+  }, [dragStatus, sel, placeAt, units, site, unitSystem]);
+
+  const levelCount = useMemo(() => new Set(units.map((u) => u.level || 0)).size, [units]);
+  const statusStatsText = `${units.length} unit${units.length === 1 ? '' : 's'} · ${levelCount} level${
+    levelCount === 1 ? '' : 's'
+  } · ${fmtArea(quoteResult.quantities.floorArea || 0, unitSystem)}`;
+
   return (
-    <View style={[styles.root, { paddingTop: insets.top }]}>
-      <View style={styles.header}>
-        <View style={styles.brand}>
-          <View style={styles.mark}>
-            <View style={styles.markDot} />
-          </View>
-          <View>
-            <Text style={styles.wordmark}>LIME CONSTRUCTS</Text>
-            {!narrow && <Text style={styles.tagline}>architectural container planner</Text>}
-          </View>
-        </View>
-
-        <View style={styles.headerRight}>
-          {wide && (
-            <Pressable onPress={() => setQuote(true)} style={styles.stats}>
-              <Text style={styles.stat}>{units.length} units</Text>
-              <View style={styles.dot} />
-              <Text style={styles.stat}>{money.area.toFixed(0)} m²</Text>
-              <View style={styles.dot} />
-              <Text style={[styles.stat, { color: c.lime, fontWeight: '700' }]}>
-                {formatCompact(money.total, meta.currency)}
-              </Text>
-            </Pressable>
-          )}
-
-          <Btn compact icon="undo" disabled={!history.length} onPress={undo} />
-          <Btn compact icon="redo" disabled={!future.length} onPress={redo} />
-
-          <View style={styles.segment}>
-            {(['3d', 'plan'] as const).map((m) => (
-              <Pressable key={m} onPress={() => setViewMode(m)} style={[styles.segBtn, mode === m && styles.segOn]}>
-                <Icon name={m === '3d' ? 'cube' : 'plan'} size={14} color={mode === m ? c.bg : c.dim} />
-                {!narrow && <Text style={[styles.segText, mode === m && { color: c.bg }]}>{m === '3d' ? '3D' : 'Plan'}</Text>}
-              </Pressable>
-            ))}
-          </View>
-
-          <Btn compact icon="reset" onPress={() => setCam(camFor(mode))} />
-          <Btn
-            compact
-            icon="quote"
-            label={!narrow ? formatCompact(money.total, meta.currency) : undefined}
-            active={quote}
-            onPress={() => setQuote(true)}
-          />
-        </View>
-      </View>
-
-      <View style={[styles.body, wide && { flexDirection: 'row' }]}>
-        {wide && (
-          <View style={styles.leftRail}>
+    <View style={[styles.root, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
+      <View style={styles.mainLayout}>
+        {/* Left Sidebar (Desktop/Tablet inline) */}
+        {!isNarrow && sideState === 'open' && (
+          <View style={styles.sideDesktop}>
             <BuildPanel
               units={units}
-              selected={selected}
-              currency={meta.currency}
-              onSelect={setSelected}
-              onAdd={addUnit}
-              onPreset={(u) => {
-                const cloned = u.map((x) => ({
-                  ...x,
-                  id: makeUnit(x.type, 0, 0).id,
-                  openings: x.openings.map((o) => ({ ...o, id: makeOpening(o.typeId || 'window', o.wall, o.along).id })),
-                }));
-                commit(cloned);
-                setSelected(cloned[0]?.id || null);
-                setLevelFilter(null);
-              }}
-              onClear={() => {
-                commit([]);
-                setSelected(null);
-              }}
+              placeAt={placeAt}
+              onCancelPlace={() => setPlaceAt(null)}
+              onAddUnit={(preset) => addUnit(preset)}
+              onAddPart={(partId) => addPart(partId)}
+              onOpenPresets={() => setPresetsOpen(true)}
             />
           </View>
         )}
 
-        <View style={styles.stage}>
-          <Viewport
-            units={units}
-            selected={selected}
-            warningUnitIds={warningUnitIds}
-            onSelect={(id) => {
-              setSelected(id);
-              if (id && !wide) setTab('detail');
-            }}
-            onDragStart={handleDragStart}
-            onMoveUnit={handleMoveUnit}
-            onDragEnd={handleDragEnd}
-            moveMode={moveMode}
-            mode={mode}
-            cam={cam}
-            setCam={setCam}
-            showDimensions={showDimensions}
-            imperial={imperial}
-            levelFilter={levelFilter}
-          />
-
-          <View style={styles.overlayTop} pointerEvents="box-none">
-            <Pressable
-              onPress={() => setMoveMode(!moveMode)}
-              style={[
-                styles.chip,
-                moveMode && { borderColor: c.lime, backgroundColor: 'rgba(201,242,77,0.16)' },
-              ]}
-            >
-              <Icon name="move" size={12} color={moveMode ? c.lime : c.dim} />
-              <Text style={[styles.chipText, moveMode && { color: c.lime, fontWeight: '700' }]}>
-                {moveMode ? 'move: ON' : 'move'}
-              </Text>
-            </Pressable>
-
-            <Pressable
-              onPress={() => setShowDimensions(!showDimensions)}
-              style={[styles.chip, showDimensions && { borderColor: 'rgba(201,242,77,0.45)' }]}
-            >
-              <Icon name="ruler" size={12} color={showDimensions ? c.lime : c.dim} />
-              <Text style={[styles.chipText, showDimensions && { color: c.lime }]}>dims</Text>
-            </Pressable>
-
-            {showDimensions && (
-              <Pressable onPress={() => setImperial(!imperial)} style={styles.chip}>
-                <Text style={styles.chipText}>{imperial ? 'ft' : 'm'}</Text>
-              </Pressable>
-            )}
-
-            {maxLevel > 0 && (
+        {/* Main Section */}
+        <View style={styles.mainPane}>
+          {/* Top Bar */}
+          <View style={[styles.bar, isNarrow && styles.barNarrow]}>
+            <View style={styles.barTopRow}>
               <Pressable
-                onPress={cycleLevelFilter}
-                style={[styles.chip, levelFilter !== null && { borderColor: c.lime }]}
+                onPress={() => setSideState((s) => (s === 'open' ? 'closed' : 'open'))}
+                style={styles.iconBtn}
               >
-                <Icon name="layers" size={12} color={levelFilter !== null ? c.lime : c.dim} />
-                <Text style={[styles.chipText, levelFilter !== null && { color: c.lime }]}>
-                  {levelFilter === null ? 'all levels' : 'L' + (levelFilter + 1) + ' only'}
-                </Text>
+                <Icon name="side" size={16} color={sideState === 'open' ? c.lime : c.dim} />
               </Pressable>
-            )}
 
-            {warnItems.length > 0 && (
-              <Pressable
-                onPress={() => setShowWarnings(!showWarnings)}
-                style={[styles.chip, { borderColor: 'rgba(228,160,160,0.55)', backgroundColor: 'rgba(40,14,14,0.85)' }]}
-              >
-                <Icon name="warn" size={12} color="#E4A0A0" />
-                <Text style={[styles.chipText, { color: '#E4A0A0', fontWeight: '700' }]}>
-                  {warnItems.length} {warnItems.length === 1 ? 'issue' : 'issues'}
-                </Text>
-              </Pressable>
-            )}
-          </View>
+              <TextInput
+                value={name}
+                onChangeText={setName}
+                style={styles.titleInput}
+                placeholder="Build name"
+                placeholderTextColor={c.mute}
+              />
 
-          {showWarnings && warnItems.length > 0 && (
-            <View style={styles.warningDrawer}>
-              <View style={styles.warningHeader}>
-                <Text style={styles.warningTitle}>Structural & Spatial Checks ({warnItems.length})</Text>
-                <Pressable onPress={() => setShowWarnings(false)} hitSlop={8}>
-                  <Icon name="close" size={14} color={c.dim} />
+              {!isNarrow && (
+                <View style={styles.tabs}>
+                  {(
+                    [
+                      ['design', 'Design'],
+                      ['spec', 'Specification'],
+                      ['quote', 'Quote'],
+                      ['rates', 'Rates'],
+                    ] as const
+                  ).map(([id, label]) => (
+                    <Pressable
+                      key={id}
+                      onPress={() => setTab(id)}
+                      style={[styles.tabBtn, tab === id && styles.tabBtnActive]}
+                    >
+                      <Text style={[styles.tabText, tab === id && styles.tabTextActive]}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+
+              <View style={styles.barRight}>
+                {tab === 'design' && (
+                  <>
+                    <Pressable onPress={undo} style={styles.iconBtn}>
+                      <Icon name="undo" size={16} color={c.dim} />
+                    </Pressable>
+                    <Pressable onPress={redo} style={styles.iconBtn}>
+                      <Icon name="redo" size={16} color={c.dim} />
+                    </Pressable>
+                    {!isNarrow && (
+                      <Pressable
+                        onPress={() => setInspState((s) => (s === 'closed' ? 'open' : 'closed'))}
+                        style={styles.iconBtn}
+                      >
+                        <Icon name="insp" size={16} color={inspState !== 'closed' ? c.lime : c.dim} />
+                      </Pressable>
+                    )}
+                  </>
+                )}
+                <Pressable onPress={openMoreMenu} style={styles.iconBtn}>
+                  <Icon name="more" size={16} color={c.dim} />
                 </Pressable>
               </View>
-              {warnItems.map((w) => (
-                <Pressable
-                  key={w.id}
-                  onPress={() => {
-                    if (w.unitIds[0]) {
-                      setSelected(w.unitIds[0]);
-                      if (!wide) setTab('detail');
-                    }
-                  }}
-                  style={styles.warningItem}
-                >
+            </View>
+
+            {isNarrow && (
+              <View style={styles.tabsNarrow}>
+                {(
+                  [
+                    ['design', 'Design'],
+                    ['spec', 'Specification'],
+                    ['quote', 'Quote'],
+                    ['rates', 'Rates'],
+                  ] as const
+                ).map(([id, label]) => (
+                  <Pressable
+                    key={id}
+                    onPress={() => setTab(id)}
+                    style={[styles.tabBtn, { flex: 1, alignItems: 'center' }, tab === id && styles.tabBtnActive]}
+                  >
+                    <Text style={[styles.tabText, tab === id && styles.tabTextActive]}>{label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            )}
+          </View>
+
+          {/* Body */}
+          <View style={styles.body}>
+            {tab === 'design' && (
+              <View style={styles.designBody}>
+                {/* 3D Stage */}
+                <View style={styles.stage}>
+                  <Viewport
+                    units={units}
+                    site={site}
+                    showRoof={showRoof}
+                    level={level}
+                    spec={spec}
+                    sel={sel}
+                    cam={cam}
+                    setCam={setCam}
+                    fitTick={fitTick}
+                    onSelect={selectRef}
+                    onDragStart={() => {
+                      dragStartSnapRef.current = clone(stateRef.current);
+                    }}
+                    onDragMove={(_ref, updater) => {
+                      const res = updater(stateRef.current.units, stateRef.current.site);
+                      setUnits(res.units);
+                      setSite(res.site);
+                      if (res.status) setDragStatus(res.status);
+                    }}
+                    onDragEnd={(moved) => {
+                      setDragStatus(null);
+                      if (moved && dragStartSnapRef.current) {
+                        undoStackRef.current.push(dragStartSnapRef.current);
+                        redoStackRef.current = [];
+                      }
+                      dragStartSnapRef.current = null;
+                    }}
+                    onContextMenu={handleCanvasContextMenu}
+                    onDropPart={(partId, hit) => {
+                      const at = placementAt(hit, PART[partId] || null, units);
+                      addPart(partId, at);
+                    }}
+                  />
+
+                  {/* Bottom-left Floating Pills: Levels + Roof */}
                   <View
                     style={[
-                      styles.warningDot,
-                      { backgroundColor: w.severity === 'error' ? '#E4A0A0' : '#FFD60A' },
+                      styles.floatLeft,
+                      isNarrow && inspState === 'peek' && { bottom: 132 },
                     ]}
-                  />
-                  <Text style={styles.warningText}>{w.text}</Text>
-                </Pressable>
-              ))}
-            </View>
-          )}
+                    pointerEvents="box-none"
+                  >
+                    {topLevel > 0 && (
+                      <View style={styles.seg}>
+                        {(
+                          [
+                            ['all', 'All'],
+                            ...Array.from({ length: topLevel + 1 }, (_, i) => [i, i === 0 ? 'G' : `L${i}`] as const),
+                          ] as const
+                        ).map(([v, label]) => {
+                          const active = String(level) === String(v);
+                          return (
+                            <Pressable
+                              key={String(v)}
+                              onPress={() => setLevel(v === 'all' ? 'all' : Number(v))}
+                              style={[styles.segBtn, active && styles.segBtnActive]}
+                            >
+                              <Text style={[styles.segBtnText, active && styles.segBtnTextActive]}>
+                                {label}
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                    )}
 
-          <View style={styles.zoom} pointerEvents="box-none">
-            <Btn
-              compact
-              holdRepeat
-              icon="plus"
-              style={styles.zoomBtn}
-              onPress={() => setCam((prev) => ({ ...prev, dist: Math.max(7, prev.dist - 2.2) }))}
-            />
-            <Btn
-              compact
-              holdRepeat
-              icon="minus"
-              style={styles.zoomBtn}
-              onPress={() => setCam((prev) => ({ ...prev, dist: Math.min(75, prev.dist + 2.2) }))}
-            />
+                    <Pressable
+                      onPress={toggleRoof}
+                      style={[styles.pill, showRoof && styles.pillActive]}
+                    >
+                      <Icon name="roof" size={14} color={showRoof ? c.text : c.mute} />
+                      {!isNarrow && (
+                        <Text style={[styles.pillText, showRoof && { color: c.text }]}>Roof</Text>
+                      )}
+                    </Pressable>
+                  </View>
+
+                  {/* Bottom-right Floating Pills: Views + Fit */}
+                  <View
+                    style={[
+                      styles.floatRight,
+                      isNarrow && inspState === 'peek' && { bottom: 132 },
+                    ]}
+                    pointerEvents="box-none"
+                  >
+                    <View style={styles.seg}>
+                      {(
+                        [
+                          ['iso', '3D', 'cube3'],
+                          ['top', 'Plan', 'plan'],
+                          ...(!isNarrow
+                            ? ([
+                                ['front', 'Front', null],
+                                ['left', 'Side', null],
+                              ] as const)
+                            : []),
+                        ] as const
+                      ).map(([v, label, icName]) => {
+                        const active = viewName === v;
+                        return (
+                          <Pressable
+                            key={v}
+                            onPress={() => setView(v as 'iso' | 'top' | 'front' | 'left')}
+                            style={[styles.segBtn, active && styles.segBtnActive]}
+                          >
+                            {icName ? (
+                              <Icon name={icName} size={14} color={active ? c.bg : c.dim} />
+                            ) : null}
+                            {(!isNarrow || !icName) && (
+                              <Text style={[styles.segBtnText, active && styles.segBtnTextActive]}>
+                                {label}
+                              </Text>
+                            )}
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+
+                    <Pressable onPress={frameAll} style={styles.pillIcon}>
+                      <Icon name="fit" size={14} color={c.dim} />
+                    </Pressable>
+                  </View>
+
+                  {/* Toast */}
+                  {toast ? (
+                    <View style={styles.toast} pointerEvents="none">
+                      <Text style={styles.toastText}>{toast}</Text>
+                    </View>
+                  ) : null}
+                </View>
+
+                {/* Right Inspector (Desktop inline) */}
+                {!isNarrow && inspState !== 'closed' && (
+                  <View style={styles.inspDesktop}>
+                    <Inspector
+                      name={name}
+                      units={units}
+                      site={site}
+                      sel={sel}
+                      unitSystem={unitSystem}
+                      currency={currency}
+                      grandTotal={quoteResult.totals.grandTotal}
+                      quantities={quoteResult.quantities}
+                      rates={rates}
+                      overrides={overrides}
+                      customMaterials={customMaterials}
+                      howOpenTick={howOpenTick}
+                      onSelect={selectRef}
+                      onUpdateUnit={handleUpdateUnit}
+                      onChangeUnitPreset={handleChangeUnitPreset}
+                      onUpdateItem={handleUpdateItem}
+                      onChangeItemWall={handleChangeItemWall}
+                      onRotate={() => rotateSel(1)}
+                      onDuplicate={duplicateSel}
+                      onDelete={removeSel}
+                      onStackUnit={stackOn}
+                    />
+                  </View>
+                )}
+
+                {/* Mobile Bottom Sheet Inspector */}
+                {isNarrow && inspState !== 'closed' && (
+                  <View
+                    style={[
+                      styles.inspSheet,
+                      inspState === 'peek' ? styles.inspSheetPeek : styles.inspSheetOpen,
+                    ]}
+                  >
+                    <Pressable
+                      onPress={() => setInspState((s) => (s === 'open' ? 'peek' : 'open'))}
+                      style={styles.grabBar}
+                    >
+                      <View style={styles.grabHandle} />
+                    </Pressable>
+                    <Inspector
+                      name={name}
+                      units={units}
+                      site={site}
+                      sel={sel}
+                      unitSystem={unitSystem}
+                      currency={currency}
+                      grandTotal={quoteResult.totals.grandTotal}
+                      quantities={quoteResult.quantities}
+                      rates={rates}
+                      overrides={overrides}
+                      customMaterials={customMaterials}
+                      howOpenTick={howOpenTick}
+                      onSelect={selectRef}
+                      onUpdateUnit={handleUpdateUnit}
+                      onChangeUnitPreset={handleChangeUnitPreset}
+                      onUpdateItem={handleUpdateItem}
+                      onChangeItemWall={handleChangeItemWall}
+                      onRotate={() => rotateSel(1)}
+                      onDuplicate={duplicateSel}
+                      onDelete={removeSel}
+                      onStackUnit={stackOn}
+                    />
+                  </View>
+                )}
+              </View>
+            )}
+
+            {tab === 'spec' && (
+              <SpecPanel
+                spec={spec}
+                services={services}
+                logistics={logistics}
+                customMaterials={customMaterials}
+                quantities={quoteResult.quantities}
+                unitSystem={unitSystem}
+                onChangeSpec={(elId, optId) => setSpec((prev) => ({ ...prev, [elId]: optId }))}
+                onChangeService={(sId, qty) => setServices((prev) => ({ ...prev, [sId]: qty }))}
+                onChangeLogistics={(lId, qty) => setLogistics((prev) => ({ ...prev, [lId]: qty }))}
+              />
+            )}
+
+            {tab === 'quote' && (
+              <QuoteSheet
+                buildName={name}
+                units={units}
+                unitSystem={unitSystem}
+                currency={currency}
+                company={company}
+                commercial={commercial}
+                lines={quoteResult.lines}
+                totals={quoteResult.totals}
+                quantities={quoteResult.quantities}
+                onChangeCurrency={setCurrency}
+                onChangeCompany={(patch) => setCompany((prev) => ({ ...prev, ...patch }))}
+                onChangeCommercial={(patch) => setCommercial((prev) => ({ ...prev, ...patch }))}
+                onOverrideLine={(lineId, patch) =>
+                  setOverrides((prev) => ({ ...prev, [lineId]: { ...prev[lineId], ...patch } }))
+                }
+                onRemoveLine={(lineId) => setRemoved((prev) => [...prev, lineId])}
+                onAddCustomLine={() =>
+                  setCustomLines((prev) => [
+                    ...prev,
+                    {
+                      id: `custom:${Date.now()}`,
+                      name: 'New item',
+                      unit: 'each',
+                      qty: 1,
+                      wastage: 0,
+                      rate: 0,
+                      labour: 0,
+                    },
+                  ])
+                }
+                onToast={showToast}
+              />
+            )}
+
+            {tab === 'rates' && (
+              <RatesPanel
+                currency={currency}
+                rates={rates}
+                customMaterials={customMaterials}
+                onUpdateRate={(key, field, val) => {
+                  const book = defaultRateBook(customMaterials);
+                  setRates((prev) => ({
+                    ...prev,
+                    [key]: { ...book[key], ...prev[key], [field]: val },
+                  }));
+                }}
+                onResetRates={() => setRates({})}
+                onImportRates={(nextRates, nextMaterials) => {
+                  setRates(nextRates);
+                  if (nextMaterials) setCustomMaterials(nextMaterials);
+                }}
+                onAddMaterial={(mat) => setCustomMaterials((prev) => [...prev, mat])}
+                onRemoveMaterial={(id) => {
+                  setCustomMaterials((prev) => prev.filter((m) => m.id !== id));
+                  setSpec((prev) => {
+                    const next = { ...prev };
+                    for (const [k, v] of Object.entries(next)) {
+                      if (v === id) next[k] = 'none';
+                    }
+                    return next;
+                  });
+                }}
+                onToast={showToast}
+              />
+            )}
           </View>
 
-          <Text style={styles.hint} pointerEvents="none">
-            {moveMode
-              ? 'drag any unit to move · drag background to orbit · pinch to zoom'
-              : 'touch & hold unit to drag · drag empty space to orbit · pinch to zoom'}
-          </Text>
+          {/* Status Bar */}
+          <View style={styles.statusBar}>
+            {!isNarrow && (
+              <Text style={styles.statusSel} numberOfLines={1}>
+                {statusSelText}
+              </Text>
+            )}
+            {isNarrow && tab === 'design' && (
+              <Pressable
+                onPress={() => setInspState((s) => (s === 'open' ? 'closed' : 'open'))}
+                style={styles.mobileInspChip}
+              >
+                <Icon name="insp" size={13} color={c.text} />
+                <Text style={styles.mobileInspChipText}>Inspector</Text>
+              </Pressable>
+            )}
+            <Text style={[styles.statusStats, isNarrow && { flex: 1 }]} numberOfLines={1}>
+              {statusStatsText}
+            </Text>
+            <Pressable onPress={() => setTab('quote')} style={styles.statusTotal}>
+              <Text style={styles.statusTotalText}>{money(quoteResult.totals.grandTotal, currency)}</Text>
+            </Pressable>
+          </View>
         </View>
 
-        {wide && (
-          <View style={styles.rightRail}>
-            <Inspector
-              unit={selectedUnit}
-              allUnits={units}
-              currency={meta.currency}
-              onChange={(p) => selected && patch(selected, p)}
-              onDelete={removeSelected}
-              onDuplicate={duplicate}
-              onAddOpening={addOpening}
-              onUpdateOpening={updateOpening}
-              onRemoveOpening={(oid) =>
-                selectedUnit && patch(selectedUnit.id, { openings: selectedUnit.openings.filter((o) => o.id !== oid) })
-              }
+        {/* Mobile Left Slide-Over Drawer for Parts Library */}
+        {isNarrow && sideState === 'open' && (
+          <>
+            <Pressable
+              style={styles.scrim}
+              onPress={() => setSideState('closed')}
             />
-          </View>
-        )}
-
-        {!wide && (
-          <View style={styles.bottom}>
-            <View style={styles.tabs}>
-              {(['build', 'detail'] as const).map((t) => (
-                <Pressable key={t} onPress={() => setTab(t)} style={[styles.tab, tab === t && styles.tabOn]}>
-                  <Text style={[styles.tabText, tab === t && { color: c.text }]}>
-                    {t === 'build' ? `Build (${units.length})` : 'Detail'}
-                  </Text>
-                </Pressable>
-              ))}
-              <View style={{ flex: 1 }} />
-              <Text style={styles.tabMeta}>
-                {selectedUnit ? (selectedUnit.label || TYPE[selectedUnit.type].short) + ' · L' + (selectedUnit.level + 1) : 'no selection'}
-              </Text>
+            <View style={styles.sideDrawerMobile}>
+              <BuildPanel
+                units={units}
+                placeAt={placeAt}
+                onCancelPlace={() => setPlaceAt(null)}
+                onAddUnit={(preset) => addUnit(preset)}
+                onAddPart={(partId) => addPart(partId)}
+                onOpenPresets={() => setPresetsOpen(true)}
+              />
             </View>
-            <View style={{ flex: 1 }}>
-              {tab === 'build' ? (
-                <BuildPanel
-                  units={units}
-                  selected={selected}
-                  currency={meta.currency}
-                  onSelect={(id) => {
-                    setSelected(id);
-                    setTab('detail');
-                  }}
-                  onAdd={addUnit}
-                  onPreset={(u) => {
-                    const cloned = u.map((x) => ({
-                      ...x,
-                      id: makeUnit(x.type, 0, 0).id,
-                      openings: x.openings.map((o) => ({ ...o, id: makeOpening(o.typeId || 'window', o.wall, o.along).id })),
-                    }));
-                    commit(cloned);
-                    setSelected(cloned[0]?.id || null);
-                    setLevelFilter(null);
-                  }}
-                  onClear={() => {
-                    commit([]);
-                    setSelected(null);
-                  }}
-                />
-              ) : (
-                <Inspector
-                  unit={selectedUnit}
-                  allUnits={units}
-                  currency={meta.currency}
-                  onChange={(p) => selected && patch(selected, p)}
-                  onDelete={removeSelected}
-                  onDuplicate={duplicate}
-                  onAddOpening={addOpening}
-                  onUpdateOpening={updateOpening}
-                  onRemoveOpening={(oid) =>
-                    selectedUnit && patch(selectedUnit.id, { openings: selectedUnit.openings.filter((o) => o.id !== oid) })
-                  }
-                />
-              )}
-            </View>
-          </View>
+          </>
         )}
       </View>
 
-      <QuoteSheet
-        visible={quote}
-        units={units}
-        meta={meta}
-        onChangeMeta={(p) => setMeta((m) => ({ ...m, ...p }))}
-        onImportUnits={(nextUnits, nextMeta) => {
-          commit(nextUnits);
-          setSelected(nextUnits[0]?.id || null);
-          if (nextMeta) setMeta((m) => ({ ...m, ...nextMeta }));
-        }}
-        onClose={() => setQuote(false)}
-        onToast={toastFor}
+      {/* Modals */}
+      <PresetsModal
+        visible={presetsOpen}
+        onClose={() => setPresetsOpen(false)}
+        onSelectPreset={loadPreset}
       />
 
-      {toast && (
-        <View style={styles.toast} pointerEvents="none">
-          <Text style={styles.toastText}>{toast}</Text>
-        </View>
-      )}
+      <ContextMenu
+        menu={contextMenu}
+        onClose={() => setContextMenu(null)}
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: c.bg },
-  header: {
-    height: 58,
+  root: {
+    flex: 1,
+    backgroundColor: c.bg,
+  },
+  mainLayout: {
+    flex: 1,
     flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 12,
+    position: 'relative',
+  },
+  sideDesktop: {
+    width: 272,
+    borderRightWidth: 1,
+    borderRightColor: c.line,
+    backgroundColor: c.panel,
+  },
+  sideDrawerMobile: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    width: 300,
+    maxWidth: '86%',
+    zIndex: 25,
+    backgroundColor: c.panel,
+    borderRightWidth: 1,
+    borderRightColor: c.line2,
+    shadowColor: '#000',
+    shadowOpacity: 0.5,
+    shadowRadius: 16,
+    elevation: 14,
+  },
+  scrim: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    zIndex: 20,
+  },
+  mainPane: {
+    flex: 1,
+    minWidth: 0,
+  },
+  bar: {
     borderBottomWidth: 1,
     borderBottomColor: c.line,
+    backgroundColor: c.panel,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
-  brand: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  mark: {
-    width: 26,
-    height: 26,
-    borderRadius: 7,
-    borderWidth: 1.5,
-    borderColor: c.text,
-    alignItems: 'center',
-    justifyContent: 'center',
+  barNarrow: {
+    gap: 8,
   },
-  markDot: { width: 7, height: 7, borderRadius: 2, backgroundColor: c.lime },
-  wordmark: { color: c.text, fontSize: 11.5, letterSpacing: 2.2, fontWeight: '700' },
-  tagline: { color: c.mute, fontSize: 9.5, letterSpacing: 1.2, marginTop: 2 },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  stats: {
+  barTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    marginRight: 6,
-    backgroundColor: c.panel,
-    borderWidth: 1,
-    borderColor: c.line,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
   },
-  stat: { color: c.dim, fontSize: 11 },
-  dot: { width: 2, height: 2, borderRadius: 1, backgroundColor: c.line2 },
-  segment: {
+  iconBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  titleInput: {
+    flex: 1,
+    minWidth: 80,
+    maxWidth: 300,
+    height: 32,
+    paddingHorizontal: 8,
+    borderRadius: 6,
+    color: c.text,
+    fontSize: 15.5,
+    fontWeight: '600',
+  },
+  tabs: {
     flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    padding: 3,
+    marginLeft: 'auto',
     backgroundColor: c.panel2,
     borderRadius: 9,
     borderWidth: 1,
     borderColor: c.line,
-    padding: 2,
   },
-  segBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 9, height: 28, borderRadius: 7 },
-  segOn: { backgroundColor: c.lime },
-  segText: { color: c.dim, fontSize: 11, fontWeight: '600' },
-  body: { flex: 1 },
-  leftRail: { width: 276, borderRightWidth: 1, borderRightColor: c.line, backgroundColor: c.panel },
-  rightRail: { width: 320, borderLeftWidth: 1, borderLeftColor: c.line, backgroundColor: c.panel },
-  stage: { flex: 1, position: 'relative' },
-  overlayTop: { position: 'absolute', top: 12, left: 12, right: 56, flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
-  chip: {
+  tabsNarrow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
+    gap: 2,
+    padding: 3,
+    backgroundColor: c.panel2,
+    borderRadius: 9,
     borderWidth: 1,
     borderColor: c.line,
-    backgroundColor: 'rgba(10,11,13,0.82)',
-    borderRadius: 8,
-    paddingHorizontal: 9,
-    paddingVertical: 5,
   },
-  chipText: { color: c.dim, fontSize: 10.5, letterSpacing: 0.5 },
-  warningDrawer: {
+  tabBtn: {
+    height: 28,
+    paddingHorizontal: 12,
+    borderRadius: 7,
+    justifyContent: 'center',
+  },
+  tabBtnActive: {
+    backgroundColor: c.raised,
+  },
+  tabText: {
+    color: c.dim,
+    fontSize: 12.5,
+    fontWeight: '500',
+  },
+  tabTextActive: {
+    color: c.text,
+    fontWeight: '600',
+  },
+  barRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    marginLeft: 'auto',
+  },
+  body: {
+    flex: 1,
+    minHeight: 0,
+  },
+  designBody: {
+    flex: 1,
+    flexDirection: 'row',
+    position: 'relative',
+  },
+  stage: {
+    flex: 1,
+    position: 'relative',
+  },
+  inspDesktop: {
+    width: 316,
+    borderLeftWidth: 1,
+    borderLeftColor: c.line,
+    backgroundColor: c.panel,
+  },
+  inspSheet: {
     position: 'absolute',
-    top: 46,
-    left: 12,
-    maxWidth: 380,
-    backgroundColor: 'rgba(14,15,17,0.95)',
-    borderWidth: 1,
-    borderColor: 'rgba(228,160,160,0.45)',
-    borderRadius: 12,
-    padding: 12,
-    gap: 8,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 12,
+    backgroundColor: c.panel,
+    borderTopWidth: 1,
+    borderTopColor: c.line2,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    shadowColor: '#000',
+    shadowOpacity: 0.45,
+    shadowRadius: 12,
+    elevation: 10,
+    overflow: 'hidden',
   },
-  warningHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  warningTitle: { color: '#E4A0A0', fontSize: 11, fontWeight: '700', letterSpacing: 0.6, textTransform: 'uppercase' },
-  warningItem: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
-  warningDot: { width: 6, height: 6, borderRadius: 3, marginTop: 5 },
-  warningText: { flex: 1, color: c.text, fontSize: 11.5, lineHeight: 16 },
-  zoom: { position: 'absolute', right: 12, top: 12, gap: 6 },
-  zoomBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: c.line,
-    backgroundColor: 'rgba(10,11,13,0.75)',
+  inspSheetPeek: {
+    height: 120,
+  },
+  inspSheetOpen: {
+    height: '62%',
+  },
+  grabBar: {
+    height: 22,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  hint: {
-    position: 'absolute',
-    bottom: 12,
-    left: 0,
-    right: 0,
-    textAlign: 'center',
-    color: 'rgba(255,255,255,0.28)',
-    fontSize: 10.5,
+  grabHandle: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: c.line2,
   },
-  bottom: { height: 310, borderTopWidth: 1, borderTopColor: c.line, backgroundColor: c.panel },
-  tabs: {
+  floatLeft: {
+    position: 'absolute',
+    left: 12,
+    bottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  floatRight: {
+    position: 'absolute',
+    right: 12,
+    bottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  seg: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    padding: 3,
+    backgroundColor: 'rgba(14,15,17,0.9)',
+    borderWidth: 1,
+    borderColor: c.line2,
+    borderRadius: 9,
+  },
+  segBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    height: 28,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+  },
+  segBtnActive: {
+    backgroundColor: c.lime,
+  },
+  segBtnText: {
+    color: c.dim,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  segBtnTextActive: {
+    color: c.bg,
+  },
+  pill: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
+    height: 34,
     paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: c.line,
-  },
-  tab: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 7 },
-  tabOn: { backgroundColor: c.panel2, borderWidth: 1, borderColor: c.line },
-  tabText: { color: c.dim, fontSize: 12, fontWeight: '600' },
-  tabMeta: { color: c.lime, fontSize: 10.5, letterSpacing: 0.8, fontWeight: '600' },
-  toast: {
-    position: 'absolute',
-    bottom: 26,
-    alignSelf: 'center',
-    backgroundColor: c.raised,
+    backgroundColor: 'rgba(14,15,17,0.9)',
     borderWidth: 1,
     borderColor: c.line2,
-    borderRadius: 999,
-    paddingHorizontal: 16,
-    paddingVertical: 9,
+    borderRadius: 9,
   },
-  toastText: { color: c.text, fontSize: 12 },
+  pillActive: {
+    borderColor: c.lime,
+  },
+  pillText: {
+    color: c.mute,
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  pillIcon: {
+    width: 34,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(14,15,17,0.9)',
+    borderWidth: 1,
+    borderColor: c.line2,
+    borderRadius: 9,
+  },
+  toast: {
+    position: 'absolute',
+    top: 14,
+    alignSelf: 'center',
+    maxWidth: 420,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 9,
+    backgroundColor: c.text,
+  },
+  toastText: {
+    color: c.bg,
+    fontSize: 12.5,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  statusBar: {
+    height: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 12,
+    borderTopWidth: 1,
+    borderTopColor: c.line,
+    backgroundColor: c.panel,
+  },
+  statusSel: {
+    flex: 1,
+    color: c.mute,
+    fontSize: 12,
+  },
+  statusStats: {
+    color: c.mute,
+    fontSize: 12,
+  },
+  statusTotal: {
+    height: 26,
+    paddingHorizontal: 12,
+    borderRadius: 7,
+    backgroundColor: c.lime,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  statusTotalText: {
+    color: c.bg,
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  mobileInspChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    height: 26,
+    paddingHorizontal: 9,
+    borderRadius: 7,
+    backgroundColor: c.panel2,
+    borderWidth: 1,
+    borderColor: c.line2,
+  },
+  mobileInspChipText: {
+    color: c.text,
+    fontSize: 11.5,
+    fontWeight: '500',
+  },
 });

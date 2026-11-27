@@ -30,7 +30,9 @@ export function Btn({
 }) {
   const color = disabled ? c.mute : active ? c.lime : danger ? '#E4A0A0' : c.text;
   const onPressRef = React.useRef(onPress);
-  onPressRef.current = onPress;
+  React.useEffect(() => {
+    onPressRef.current = onPress;
+  }, [onPress]);
   const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const intervalRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
